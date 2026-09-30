@@ -550,7 +550,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 			return nil, cliproxyexecutor.NewUpstreamWebsocketReplayRequiredError()
 		}
 	} else {
-		conn, closer, respHS, errDial = e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+		conn, closer, respHS, errDial = e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, opts)
 	}
 	var upstreamHeaders http.Header
 	if respHS != nil {
@@ -606,7 +606,7 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 				sess.reqMu.Unlock()
 				return nil, errSend
 			}
-			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders)
+			connRetry, closerRetry, respHSRetry, errDialRetry := e.ensureUpstreamConn(ctx, auth, sess, authID, wsURL, wsHeaders, opts)
 			if errDialRetry != nil || connRetry == nil {
 				bodyErrRetry := websocketHandshakeBody(respHSRetry)
 				closeHTTPResponseBody(respHSRetry, "xai websockets executor: close handshake response body error")
@@ -698,6 +698,9 @@ func (e *XAIWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *cliprox
 		}()
 
 		send := func(chunk cliproxyexecutor.StreamChunk) bool {
+			if len(chunk.Payload) > 0 && opts.UpstreamFailureHandler != nil {
+				opts.UpstreamFailureHandler.Commit()
+			}
 			if ctx == nil {
 				out <- chunk
 				return true
@@ -1143,7 +1146,7 @@ func (e *XAIWebsocketsExecutor) UpstreamDisconnectChan(sessionID string) <-chan 
 	return sess.upstreamDisconnectCh
 }
 
-func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
+func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cliproxyauth.Auth, sess *codexWebsocketSession, authID string, wsURL string, headers http.Header, opts cliproxyexecutor.Options) (*websocket.Conn, *websocketConnectionCloser, *http.Response, error) {
 	if sess == nil {
 		return e.dialXAIWebsocket(ctx, auth, wsURL, headers)
 	}
@@ -1166,6 +1169,9 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	conn := sess.conn
 	closer := sess.connCloser
 	readerConn := sess.readerConn
+	if conn != nil {
+		sess.prepareUpstreamFailureHandlerLocked(opts)
+	}
 	sess.connMu.Unlock()
 	if conn != nil {
 		if readerConn != conn {
@@ -1188,6 +1194,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	if sess.conn != nil {
 		previous := sess.conn
 		previousCloser := sess.connCloser
+		sess.prepareUpstreamFailureHandlerLocked(opts)
 		sess.connMu.Unlock()
 		if errClose := closer.Close(); errClose != nil {
 			log.Errorf("xai websockets executor: close websocket error: %v", errClose)
@@ -1201,6 +1208,7 @@ func (e *XAIWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *cl
 	sess.authID = authID
 	sess.proxyURL = proxyURL
 	sess.readerConn = conn
+	sess.prepareUpstreamFailureHandlerLocked(opts)
 	sess.connMu.Unlock()
 
 	configureXAIWebsocketConn(sess, conn)
@@ -1298,10 +1306,13 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 			invalidate := func() {
 				e.invalidateUpstreamConn(sess, conn, "upstream_disconnected", errRead)
 			}
-			invalidated := false
+			invalidated := e.invalidateUpstreamConnWithNotify(sess, conn, "upstream_disconnected", errRead, true, true)
+			if invalidated {
+				invalidate = nil
+			}
 			ch, done := sess.activeForConn(conn)
 			if ch != nil {
-				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate)
+				invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errRead}, invalidate) || invalidated
 				if sess.clearActive(conn, ch) {
 					close(ch)
 				}
@@ -1318,10 +1329,13 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 				invalidate := func() {
 					e.invalidateUpstreamConn(sess, conn, "unexpected_binary", errBinary)
 				}
-				invalidated := false
+				invalidated := e.invalidateUpstreamConnWithNotify(sess, conn, "unexpected_binary", errBinary, true, true)
+				if invalidated {
+					invalidate = nil
+				}
 				ch, done := sess.activeForConn(conn)
 				if ch != nil {
-					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate)
+					invalidated = sendTerminalWebsocketRead(ch, done, codexWebsocketRead{conn: conn, err: errBinary}, invalidate) || invalidated
 					if sess.clearActive(conn, ch) {
 						close(ch)
 					}
@@ -1354,16 +1368,16 @@ func (e *XAIWebsocketsExecutor) readUpstreamLoop(sess *codexWebsocketSession, co
 }
 
 func (e *XAIWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, true)
+	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, true, false)
 }
 
 func (e *XAIWebsocketsExecutor) invalidateUpstreamConnWithoutDisconnectNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error) {
-	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, false)
+	e.invalidateUpstreamConnWithNotify(sess, conn, reason, err, false, false)
 }
 
-func (e *XAIWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notify bool) {
+func (e *XAIWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebsocketSession, conn *websocket.Conn, reason string, err error, notify, recoveryOnly bool) bool {
 	if sess == nil || conn == nil {
-		return
+		return false
 	}
 
 	sess.connMu.Lock()
@@ -1373,9 +1387,25 @@ func (e *XAIWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebs
 	sessionID := sess.sessionID
 	if current == nil || current != conn {
 		sess.connMu.Unlock()
-		return
+		return false
 	}
 	lifecycle := sess.lifecycle
+	finishFailure := func() {
+		if notify {
+			sess.notifyUpstreamDisconnect(err)
+		}
+		if lifecycle != nil {
+			lifecycle.End(reason)
+		}
+	}
+	failureHandler := sess.upstreamFailureHandler
+	deferFailure := failureHandler != nil && failureHandler.Defer(err, finishFailure)
+	if recoveryOnly && !deferFailure {
+		sess.connMu.Unlock()
+		return false
+	}
+	sess.setUpstreamDisconnectError(conn, err)
+	sess.upstreamFailureHandler = nil
 	closer := sess.connCloser
 	sess.lifecycle = nil
 	sess.lifecycleModel = ""
@@ -1388,17 +1418,20 @@ func (e *XAIWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWebs
 
 	lastEvent := sess.getLastEventType(conn)
 	logXAIWebsocketDisconnectedWithLastEvent(sess, sessionID, authID, wsURL, reason, lastEvent, err)
-	if notify {
+
+	if notify && !deferFailure {
 		sess.notifyUpstreamDisconnect(err)
 	}
+
 	if closer != nil {
 		if errClose := closer.Close(); errClose != nil {
 			log.Errorf("xai websockets executor: close websocket error: %v", errClose)
 		}
 	}
-	if lifecycle != nil {
+	if lifecycle != nil && !deferFailure {
 		lifecycle.End(reason)
 	}
+	return deferFailure
 }
 
 func (e *XAIWebsocketsExecutor) CloseExecutionSession(sessionID string) {
