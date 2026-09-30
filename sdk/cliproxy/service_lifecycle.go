@@ -286,9 +286,6 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		if s.watcherCancel != nil {
 			s.watcherCancel()
 		}
-		if s.coreManager != nil {
-			s.coreManager.StopAutoRefresh()
-		}
 		if s.watcher != nil {
 			if err := s.watcher.Stop(); err != nil {
 				log.Errorf("failed to stop file watcher: %v", err)
@@ -332,6 +329,14 @@ func (s *Service) Shutdown(ctx context.Context) error {
 				}
 			}
 		}
+		// Save affinity after listeners and gateways close. The API server does not
+		// drain result callbacks; mutations after the cache snapshot are excluded.
+		s.configRuntimeMu.Lock()
+		s.configRuntimeStopped = true
+		if s.coreManager != nil {
+			s.coreManager.StopAutoRefresh()
+		}
+		s.configRuntimeMu.Unlock()
 
 		if s.pluginHost != nil {
 			sdktranslator.SetPluginHooks(nil)

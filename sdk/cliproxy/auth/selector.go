@@ -910,6 +910,8 @@ func availabilityBlock(unavailable, quotaExceeded bool, nextRetryAfter, nextReco
 // It extracts session ID from multiple sources and maintains session-to-auth
 // mappings with automatic failover when the bound auth becomes unavailable.
 type SessionAffinitySelector struct {
+	lifecycleMu      sync.Mutex
+	cacheTransferred bool
 	fallback         Selector
 	cache            *SessionCache
 	matcher          *cliproxysession.MerklePrefixMatcher
@@ -1332,12 +1334,45 @@ func (s *SessionAffinitySelector) Stop() {
 	if s == nil {
 		return
 	}
-	if s.cache != nil {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.cache != nil && !s.cacheTransferred {
 		s.cache.Stop()
 	}
 	if s.matcher != nil {
 		s.matcher.Clear()
 	}
+}
+
+// transferCache keeps late results from the previous selector in the live cache.
+// The replacement has not been published to request routing yet.
+func (s *SessionAffinitySelector) transferCache(next *SessionAffinitySelector) {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	next.lifecycleMu.Lock()
+	defer next.lifecycleMu.Unlock()
+	if s.cache == nil || s.cacheTransferred {
+		return
+	}
+	s.cache.persistenceMu.Lock()
+	stopped := s.cache.stopped
+	s.cache.persistenceMu.Unlock()
+	if stopped {
+		return
+	}
+	if next.cache != s.cache {
+		next.cache.mu.RLock()
+		ttl := next.cache.ttl
+		next.cache.mu.RUnlock()
+		next.cache.Stop()
+		next.cache = s.cache
+		s.cache.mu.Lock()
+		s.cache.ttl = ttl
+		s.cache.mu.Unlock()
+	}
+	s.cache.flushPersistence()
+	s.cacheTransferred = true
+	next.cacheTransferred = false
 }
 
 // InvalidateAuth removes all session bindings for a specific auth.
