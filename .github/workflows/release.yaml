@@ -52,12 +52,9 @@ jobs:
           if previous_tag_value="$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null)"; then
             previous_tag="$previous_tag_value"
             changelog_range="${previous_tag}..${GITHUB_REF_NAME}"
-          else
-            changelog_range="$GITHUB_REF_NAME"
+            git log --reverse --pretty=format:'- %s (%h)' "$changelog_range" |
+              grep -Ev '^- (docs:|test:)' > "$changelog_entries_file" || true
           fi
-
-          git log --reverse --pretty=format:'- %s (%h)' "$changelog_range" |
-            grep -Ev '^- (docs:|test:)' > "$changelog_entries_file" || true
 
           gh api "repos/${GH_REPO}/releases/generate-notes" \
             -f tag_name="$GITHUB_REF_NAME" \
