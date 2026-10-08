@@ -1429,7 +1429,7 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			resp, creditsCtx, errExec := executeWithSameUpstreamRetry(creditsCtx, m, c.auth, remainingRetries, func(attemptCtx context.Context) (cliproxyexecutor.Response, error) {
 				return c.executor.Execute(attemptCtx, c.auth, execReq, creditsOpts)
 			})
-			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts}
+			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts, CredentialVersion: c.auth.CredentialVersion, RegistrationEpoch: c.auth.RegistrationEpoch}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {
