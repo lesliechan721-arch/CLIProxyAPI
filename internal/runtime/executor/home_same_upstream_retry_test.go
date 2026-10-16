@@ -170,3 +170,104 @@ func TestHomeCodexSameUpstreamRetryReleasesTerminalScope(t *testing.T) {
 		t.Fatalf("connection present=%t active Home scopes=%d, want the failed connection and scope released", conn != nil, len(active))
 	}
 }
+
+func TestHomeCodexUnbufferedErrorSameUpstreamRetry(t *testing.T) {
+	for _, failure := range []struct {
+		name, frame string
+	}{
+		{"error", `{"type":"error","status":503,"error":{"type":"server_error","message":"upstream overloaded"}}`},
+		{"response_failed", `{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"server_error","status":500,"message":"upstream processing failed"}}}`},
+	} {
+		for _, mode := range []string{"recovered", "exhausted", "after_payload"} {
+			t.Run(failure.name+"/"+mode, func(t *testing.T) {
+				var attempts atomic.Int32
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+					if err != nil {
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					if _, _, err = conn.ReadMessage(); err != nil {
+						return
+					}
+					attempt := attempts.Add(1)
+					frames := []string{failure.frame}
+					if mode == "recovered" && attempt > 1 {
+						frames = []string{codexCreatedEvent, codexCompletedEventBody}
+					} else if mode == "after_payload" {
+						frames = append([]string{codexCreatedEvent}, frames...)
+					}
+					for _, frame := range frames {
+						if err = conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+							return
+						}
+					}
+					_, _, _ = conn.ReadMessage()
+				}))
+				defer server.Close()
+				cfg := codexBufferingConfig(false)
+				cfg.SameUpstreamRetry = 1
+				cfg.Home = config.HomeConfig{Enabled: true}
+				exec := NewCodexWebsocketsExecutor(cfg)
+				exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+				auth := codexTestAuth(server.URL)
+				auth.ID, auth.Provider = "same-upstream-unbuffered", "codex"
+				auth.Attributes["websockets"] = "true"
+				dispatcher := &sameUpstreamHomeDispatcher{auth: auth}
+				scopes := executionregistry.New()
+				manager := cliproxyauth.NewManager(nil, nil, nil)
+				manager.SetConfig(cfg)
+				manager.SetRetryConfig(0, 0, 0)
+				manager.PublishHomeDispatch(dispatcher, scopes, 1)
+				manager.RegisterExecutor(exec)
+				defer manager.CloseExecutionSession(t.Name())
+				req, opts := codexWebsocketRequest()
+				opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: t.Name()}
+				ctx, cancel := context.WithTimeout(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), 5*time.Second)
+				defer cancel()
+				result, errStream := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
+				if result != nil {
+					_, errDrain := drainChunks(result)
+					if errStream == nil {
+						errStream = errDrain
+					}
+				}
+				if mode == "recovered" {
+					if errStream != nil {
+						t.Fatal(errStream)
+					}
+					select {
+					case errDisconnect := <-exec.UpstreamDisconnectChan(t.Name()):
+						t.Fatalf("recovered retry notified downstream disconnect: %v", errDisconnect)
+					default:
+					}
+				} else {
+					if mode == "exhausted" && errStream == nil {
+						t.Fatal("expected terminal stream error")
+					}
+					select {
+					case <-exec.UpstreamDisconnectChan(t.Name()):
+					case <-ctx.Done():
+						t.Fatal("terminal stream error did not notify downstream disconnect")
+					}
+					if active := scopes.FreezeInFlight(time.Time{}).Executions; len(active) != 0 {
+						t.Fatalf("terminal stream retained %d Home scopes", len(active))
+					}
+				}
+				if mode == "exhausted" {
+					if attempts.Load() < 2 {
+						t.Fatalf("attempts=%d, want retry budget exhausted", attempts.Load())
+					}
+				} else {
+					wantAttempts := int32(2)
+					if mode == "after_payload" {
+						wantAttempts = 1
+					}
+					if attempts.Load() != wantAttempts || dispatcher.calls.Load() != 1 {
+						t.Fatalf("attempts=%d dispatches=%d, want %d attempts in one Home scope", attempts.Load(), dispatcher.calls.Load(), wantAttempts)
+					}
+				}
+			})
+		}
+	}
+}

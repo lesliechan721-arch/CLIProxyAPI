@@ -130,6 +130,82 @@ func TestManagerSameUpstreamRetry(t *testing.T) {
 	}
 }
 
+func TestSameUpstreamRetrySuccessOrdersConcurrentCooldown(t *testing.T) {
+	withQuotaCooldownEnabled(t)
+	for _, kind := range []string{"execute", "count", "stream", "bootstrap", "credits"} {
+		for _, cooldownAfterRetryDispatch := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/cooldown-after-retry-dispatch=%t", kind, cooldownAfterRetryDispatch), func(t *testing.T) {
+				manager := NewManager(nil, &FillFirstSelector{}, nil)
+				manager.SetConfig(&internalconfig.Config{SameUpstreamRetry: 1, QuotaExceeded: internalconfig.QuotaExceeded{AntigravityCredits: true}})
+				manager.SetRetryConfig(0, 0, 0)
+				authID, model := t.Name(), "claude-retry-cooldown-order"
+				provider := "same-upstream"
+				if kind == "credits" {
+					provider = "antigravity"
+				}
+				if _, errRegister := manager.Register(context.Background(), &Auth{ID: authID, Provider: provider, Status: StatusActive}); errRegister != nil {
+					t.Fatal(errRegister)
+				}
+				registry.GetGlobalRegistry().RegisterClient(authID, provider, []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+
+				calls := 0
+				execute := func(ctx context.Context, _ *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+					calls++
+					if (calls == 1 && !cooldownAfterRetryDispatch) || (calls == 2 && cooldownAfterRetryDispatch) {
+						// Model another dispatch recording a quota error while this attempt is in flight.
+						manager.MarkResult(ctx, Result{
+							AuthID: authID, Provider: provider, Model: model,
+							ExecutionSeq: manager.nextExecutionSeq(),
+							Error:        &Error{HTTPStatus: http.StatusTooManyRequests, Retryable: true},
+						})
+					}
+					if calls == 1 {
+						return cliproxyexecutor.Response{}, &Error{HTTPStatus: http.StatusServiceUnavailable}
+					}
+					return cliproxyexecutor.Response{Payload: []byte("ok")}, nil
+				}
+				manager.RegisterExecutor(&customStreamMockExecutor{
+					identifier:              provider,
+					mockCustomErrorExecutor: mockCustomErrorExecutor{executeFn: execute, countFn: execute},
+					streamFn: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+						resp, errExecute := execute(ctx, auth, req, opts)
+						if errExecute != nil && kind != "bootstrap" {
+							return nil, errExecute
+						}
+						chunks := make(chan cliproxyexecutor.StreamChunk, 1)
+						chunks <- cliproxyexecutor.StreamChunk{Payload: resp.Payload, Err: errExecute}
+						close(chunks)
+						return &cliproxyexecutor.StreamResult{Chunks: chunks}, nil
+					},
+				})
+				if kind == "credits" {
+					if _, handled, errExecute := manager.tryAntigravityCreditsExecute(context.Background(), cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{}); errExecute != nil || !handled {
+						t.Fatalf("credits fallback handled=%t, error=%v", handled, errExecute)
+					}
+				} else if errExecute := invokeSameUpstreamRetry(context.Background(), manager, kind, model, cliproxyexecutor.Options{}); errExecute != nil {
+					t.Fatal(errExecute)
+				}
+				if calls != 2 {
+					t.Fatalf("calls = %d, want 2", calls)
+				}
+				updated, ok := manager.GetByID(authID)
+				if !ok || updated == nil || updated.ModelStates[model] == nil {
+					t.Fatal("expected model state after execution")
+				}
+				state := updated.ModelStates[model]
+				if cooldownAfterRetryDispatch {
+					if !state.Unavailable || !state.Quota.Exceeded {
+						t.Fatal("retry success cleared a cooldown recorded after its dispatch")
+					}
+				} else if state.Unavailable || state.Quota.Exceeded || !state.NextRetryAfter.IsZero() {
+					t.Fatal("retry success did not clear a cooldown recorded before its dispatch")
+				}
+			})
+		}
+	}
+}
+
 func TestHomeSameUpstreamRetryKeepsSelection(t *testing.T) {
 	for _, kind := range []string{"execute", "count", "stream", "bootstrap"} {
 		t.Run(kind, func(t *testing.T) {

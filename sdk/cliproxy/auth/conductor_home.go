@@ -1423,13 +1423,15 @@ func (m *Manager) tryAntigravityCreditsExecute(ctx context.Context, req cliproxy
 			execReq := req
 			execReq.Model = upstreamModel
 			creditsCtx = syncMetadataSessionToContext(creditsCtx, creditsOpts.Metadata)
+			var executionSeq uint64
 			creditsCtx = newUpstreamAttemptContext(creditsCtx)
 			remainingRetries := &atomic.Int64{}
 			remainingRetries.Store(int64(m.sameUpstreamRetryCount()))
 			resp, creditsCtx, errExec := executeWithSameUpstreamRetry(creditsCtx, m, c.auth, remainingRetries, func(attemptCtx context.Context) (cliproxyexecutor.Response, error) {
+				executionSeq = m.nextExecutionSeq()
 				return c.executor.Execute(attemptCtx, c.auth, execReq, creditsOpts)
 			})
-			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts, CredentialVersion: c.auth.CredentialVersion, RegistrationEpoch: c.auth.RegistrationEpoch}
+			result := Result{AuthID: c.auth.ID, Provider: c.provider, Model: resultModel, RouteModel: routeModel, Success: errExec == nil, Options: creditsOpts, CredentialVersion: c.auth.CredentialVersion, RegistrationEpoch: c.auth.RegistrationEpoch, ExecutionSeq: executionSeq}
 			if errExec != nil {
 				result.Error = resultErrorFromError(errExec)
 				if ra := retryAfterFromError(errExec); ra != nil {

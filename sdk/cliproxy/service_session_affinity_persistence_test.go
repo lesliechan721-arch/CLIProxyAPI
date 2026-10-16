@@ -92,13 +92,22 @@ func TestBuilderSessionAffinityPersistenceRestartAndHotReload(t *testing.T) {
 	if got := pickPersistenceSession(t, replacement, "late", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {
 		t.Fatal("late old selector binding was discarded")
 	}
+	rebind := changed
+	rebind.Routing.SessionAffinityRebindOn = coreauth.SessionAffinityRebindOnQuota
+	service.applyWatcherConfigUpdate(&rebind)
+	if service.coreManager.Selector() == replacement {
+		t.Fatal("rebind policy update did not replace selector")
+	}
+	if got := pickPersistenceSession(t, service.coreManager.Selector(), "late", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {
+		t.Fatal("rebind policy update discarded the persisted binding")
+	}
 	if errShutdown := service.Shutdown(context.Background()); errShutdown != nil {
 		t.Fatal(errShutdown)
 	}
 	if _, errStat := os.Stat(path); errStat != nil {
 		t.Fatal(errStat)
 	}
-	restarted := buildSessionPersistenceService(t, &changed)
+	restarted := buildSessionPersistenceService(t, &rebind)
 	for _, session := range []string{"stable", "late"} {
 		if got := pickPersistenceSession(t, restarted.coreManager.Selector(), session, &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {
 			t.Fatalf("restarted session %q selected %q, want b", session, got)
