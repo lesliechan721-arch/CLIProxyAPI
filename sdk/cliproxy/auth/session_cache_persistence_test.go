@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -45,8 +46,8 @@ func TestSessionAffinityPersistenceRestartPreservesAliasesAndExpiry(t *testing.T
 	expires := time.Now().Add(25 * time.Minute).UTC()
 	selector.cache.mu.Lock()
 	entry := selector.cache.entries[primary]
-	selector.cache.replaceAliasGroupsLocked(picked.ID, expires, entry.aliases, entry)
-	selector.cache.replaceAliasGroupsLocked("expired-auth", time.Now().Add(-time.Minute), []string{sessionTestKey("expired")})
+	selector.cache.replaceAliasGroupsLocked(picked.ID, expires, entry.aliases, entry.binding, entry)
+	selector.cache.replaceAliasGroupsLocked("expired-auth", time.Now().Add(-time.Minute), []string{sessionTestKey("expired")}, sessionBinding{})
 	selector.cache.mu.Unlock()
 	manager.StopAutoRefresh()
 
@@ -106,7 +107,7 @@ func TestSessionCachePersistenceRefreshDeleteAndEviction(t *testing.T) {
 	cache.SetAliases("b", sessionTestKey("keep"), sessionTestKey("delete"))
 	cache.mu.Lock()
 	entry := cache.entries[sessionTestKey("keep")]
-	cache.replaceAliasGroupsLocked(entry.authID, time.Now().Add(10*time.Minute), entry.aliases, entry)
+	cache.replaceAliasGroupsLocked(entry.authID, time.Now().Add(10*time.Minute), entry.aliases, entry.binding, entry)
 	cache.mu.Unlock()
 	cache.flushPersistence()
 	initial := readSessionTestSnapshot(t, path).Groups[1].ExpiresAt
@@ -453,5 +454,121 @@ func TestManagerSessionAffinityPersistenceStopThenReplace(t *testing.T) {
 	manager.StopAutoRefresh()
 	if got := readSessionTestSnapshot(t, path); len(got.Groups) != 1 || got.Groups[0].AuthID != "b" {
 		t.Fatalf("replacement cache failed to start persistence: %+v", got.Groups)
+	}
+}
+
+func TestSessionAffinityPersistenceGuardianRestart(t *testing.T) {
+	for _, providers := range []struct{ parent, child string }{
+		{"codex", "codex"}, {"mixed", "codex"}, {"codex", "mixed"},
+	} {
+		t.Run(providers.parent+"_to_"+providers.child, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "session-affinity.cache")
+			authA := &Auth{ID: "auth-a", Provider: "codex"}
+			authB := &Auth{ID: "auth-b", Provider: "codex"}
+			candidates := []*Auth{authA, authB}
+			selector := NewSessionAffinitySelector(&FillFirstSelector{})
+			manager := NewManager(nil, selector, nil)
+			t.Cleanup(manager.StopAutoRefresh)
+			manager.ConfigureSessionAffinityPersistence(path, true)
+			olderOpts := guardianTestOptions("parent", "")
+			guardianTestPick(t, selector, providers.parent, "older-model", olderOpts, []*Auth{authA}, "auth-a")
+			guardianTestPick(t, selector, providers.child, "review-model", guardianTestOptions("existing-child", "parent"), candidates, "auth-a")
+			guardianTestPick(t, selector, providers.parent, "parent-model", guardianTestOptions("parent", ""), []*Auth{authB}, "auth-b")
+			// A late result changes eviction order without changing selection order.
+			selector.OnResult(Result{AuthID: "auth-a", Provider: "codex", Model: "older-model", Success: true, Options: olderOpts})
+			manager.StopAutoRefresh()
+			snapshot := readSessionTestSnapshot(t, path)
+			var parentExpiry time.Time
+			parentKey := providers.parent + "::codex:parent::parent-model"
+			for _, group := range snapshot.Groups {
+				if group.Aliases[0] == parentKey {
+					parentExpiry = group.ExpiresAt
+				}
+			}
+			if parentExpiry.IsZero() {
+				t.Fatal("parent binding missing from snapshot")
+			}
+			restored := NewSessionAffinitySelector(&FillFirstSelector{})
+			restoredManager := NewManager(nil, restored, nil)
+			t.Cleanup(restoredManager.StopAutoRefresh)
+			restoredManager.ConfigureSessionAffinityPersistence(path, true)
+			guardianTestPick(t, restored, providers.child, "review-model", guardianTestOptions("new-child", "parent"), candidates, "auth-b")
+			guardianTestPick(t, restored, providers.child, "review-model", guardianTestOptions("existing-child", "parent"), candidates, "auth-a")
+			restored.cache.mu.RLock()
+			gotExpiry := restored.cache.entries[parentKey].expiresAt
+			restored.cache.mu.RUnlock()
+			if !gotExpiry.Equal(parentExpiry) {
+				t.Fatal("guardian lookup extended the restored parent's TTL")
+			}
+			// New selections must be newer than all restored selections.
+			guardianTestPick(t, restored, providers.parent, "next-parent-model", guardianTestOptions("parent", ""), []*Auth{authA}, "auth-a")
+			guardianTestPick(t, restored, providers.child, "review-model", guardianTestOptions("next-child", "parent"), candidates, "auth-a")
+		})
+	}
+}
+
+func TestSessionAffinityPersistenceLegacySnapshotDoesNotInventGuardianHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session-affinity.cache")
+	expiry := time.Now().Add(time.Hour).UTC()
+	legacy := fmt.Sprintf(`{"version":1,"groups":[{"auth_id":"auth-b","aliases":["codex::codex:parent::parent-model"],"expires_at":%q}]}`, expiry.Format(time.RFC3339Nano))
+	if errWrite := os.WriteFile(path, []byte(legacy), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	selector := NewSessionAffinitySelector(&FillFirstSelector{})
+	manager := NewManager(nil, selector, nil)
+	t.Cleanup(manager.StopAutoRefresh)
+	manager.ConfigureSessionAffinityPersistence(path, true)
+	authA := &Auth{ID: "auth-a", Provider: "codex"}
+	authB := &Auth{ID: "auth-b", Provider: "codex"}
+	candidates := []*Auth{authA, authB}
+	guardianTestPick(t, selector, "codex", "review-model", guardianTestOptions("before-parent", "parent"), candidates, "auth-a")
+	guardianTestPick(t, selector, "codex", "parent-model", guardianTestOptions("parent", ""), candidates, "auth-b")
+	guardianTestPick(t, selector, "codex", "review-model", guardianTestOptions("after-parent", "parent"), candidates, "auth-b")
+}
+
+func TestSessionAffinityPersistenceLiveSelectionWinsRestoredHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session-affinity.cache")
+	selector := NewSessionAffinitySelector(&FillFirstSelector{})
+	manager := NewManager(nil, selector, nil)
+	t.Cleanup(manager.StopAutoRefresh)
+	authA := &Auth{ID: "auth-a", Provider: "codex"}
+	authB := &Auth{ID: "auth-b", Provider: "codex"}
+	authC := &Auth{ID: "auth-c", Provider: "codex"}
+	guardianTestPick(t, selector, "codex", "live-model", guardianTestOptions("parent", ""), []*Auth{authB}, "auth-b")
+	// The persisted counter can exceed the live counter, including its integer limit.
+	raw := fmt.Sprintf(`{"version":1,"groups":[{"auth_id":"auth-a","aliases":["codex::codex:parent::saved-model"],"expires_at":%q,"binding":{"session_id":"codex:parent","provider":"codex","sequence":18446744073709551615}}]}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano))
+	if errWrite := os.WriteFile(path, []byte(raw), 0o600); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	manager.ConfigureSessionAffinityPersistence(path, true)
+	guardianTestPick(t, selector, "codex", "review-model", guardianTestOptions("live-child", "parent"), []*Auth{authA, authB}, "auth-b")
+	guardianTestPick(t, selector, "codex", "saved-model", cliproxyexecutor.Options{Headers: http.Header{"Session_id": []string{"parent"}}}, []*Auth{authA, authB}, "auth-a")
+	guardianTestPick(t, selector, "codex", "next-model", guardianTestOptions("parent", ""), []*Auth{authC}, "auth-c")
+	guardianTestPick(t, selector, "codex", "review-model", guardianTestOptions("next-child", "parent"), []*Auth{authA, authB, authC}, "auth-c")
+}
+
+func TestSessionCachePersistenceInvalidHistoryKeepsExactBinding(t *testing.T) {
+	for _, history := range []string{
+		`{"session_id":"","provider":"codex","sequence":1}`,
+		`{"session_id":"codex:parent","provider":"","sequence":1}`,
+		`{"session_id":"codex:parent","provider":"codex","sequence":0}`,
+	} {
+		t.Run(history, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "session-affinity.cache")
+			raw := fmt.Sprintf(`{"version":1,"groups":[{"auth_id":"auth-b","aliases":["codex::codex:parent::parent-model"],"expires_at":%q,"binding":%s}]}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), history)
+			if errWrite := os.WriteFile(path, []byte(raw), 0o600); errWrite != nil {
+				t.Fatal(errWrite)
+			}
+			cache := NewSessionCache(time.Hour)
+			t.Cleanup(cache.Stop)
+			cache.configurePersistence(path, true)
+			if got, ok := cache.Get("codex::codex:parent::parent-model"); !ok || got != "auth-b" {
+				t.Fatalf("invalid optional history discarded exact binding: got %q, %v", got, ok)
+			}
+			cache.flushPersistence()
+			if got := readSessionTestSnapshot(t, path); len(got.Groups) != 1 || got.Groups[0].Binding != nil {
+				t.Fatalf("invalid history was not removed from the saved binding: %+v", got.Groups)
+			}
+		})
 	}
 }

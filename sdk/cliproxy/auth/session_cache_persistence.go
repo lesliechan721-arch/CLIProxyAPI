@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -21,9 +22,17 @@ type sessionSnapshot struct {
 
 // Groups are stored from oldest to newest to preserve whole-group eviction.
 type sessionSnapshotGroup struct {
-	AuthID    string    `json:"auth_id"`
-	Aliases   []string  `json:"aliases"`
-	ExpiresAt time.Time `json:"expires_at"`
+	AuthID    string                  `json:"auth_id"`
+	Aliases   []string                `json:"aliases"`
+	ExpiresAt time.Time               `json:"expires_at"`
+	Binding   *sessionSnapshotBinding `json:"binding,omitempty"`
+}
+
+// Binding is optional so version-one snapshots without selection history remain valid.
+type sessionSnapshotBinding struct {
+	SessionID string `json:"session_id"`
+	Provider  string `json:"provider"`
+	Sequence  uint64 `json:"sequence"`
 }
 
 type sessionCachePersistence struct {
@@ -118,9 +127,15 @@ func (p *sessionCachePersistence) flush() {
 	snapshot := sessionSnapshot{Version: sessionSnapshotVersion, Groups: make([]sessionSnapshotGroup, 0, len(c.groups))}
 	for element := c.evictionOrder.Front(); element != nil; element = element.Next() {
 		group := c.groups[element.Value.(string)]
-		snapshot.Groups = append(snapshot.Groups, sessionSnapshotGroup{
+		stored := sessionSnapshotGroup{
 			AuthID: group.authID, Aliases: append([]string(nil), group.aliases...), ExpiresAt: group.expiresAt,
-		})
+		}
+		if group.binding.sequence != 0 {
+			stored.Binding = &sessionSnapshotBinding{
+				SessionID: group.binding.sessionID, Provider: group.binding.provider, Sequence: group.binding.sequence,
+			}
+		}
+		snapshot.Groups = append(snapshot.Groups, stored)
 	}
 	c.mu.Unlock()
 	if errSave := p.save(p.path, snapshot); errSave != nil {
@@ -159,6 +174,7 @@ func (c *SessionCache) restoreSnapshot(path string) (uint64, bool) {
 	now := time.Now()
 	unchanged := len(c.entries) == 0
 	invalid := false
+	restored := make(map[string]struct{})
 	for _, group := range snapshot.Groups {
 		if !validSessionSnapshotGroup(group) {
 			invalid = true
@@ -184,20 +200,73 @@ func (c *SessionCache) restoreSnapshot(path string) (uint64, bool) {
 			unchanged = false
 			continue
 		}
+		binding := sessionBinding{}
+		if stored := group.Binding; stored != nil {
+			if stored.Sequence == 0 || strings.TrimSpace(stored.SessionID) == "" || strings.TrimSpace(stored.Provider) == "" {
+				// Invalid optional history must not discard an otherwise valid exact binding.
+				invalid = true
+				unchanged = false
+			} else {
+				binding = sessionBinding{sessionID: stored.SessionID, provider: stored.Provider, sequence: stored.Sequence}
+			}
+		}
 		groupCount := len(c.groups)
-		c.replaceAliasGroupsLocked(group.AuthID, group.ExpiresAt, group.Aliases, previous...)
+		c.replaceAliasGroupsLocked(group.AuthID, group.ExpiresAt, group.Aliases, binding, previous...)
+		restored[group.Aliases[0]] = struct{}{}
 		if len(c.groups) < groupCount+1 {
 			// Capacity pruning changes the persisted representation.
 			unchanged = false
 		}
 	}
+	if c.restoreBindingOrderLocked(restored) {
+		unchanged = false
+	}
 	if invalid {
-		log.Warn("ignored invalid records in session affinity snapshot")
+		log.Warn("ignored invalid data in session affinity snapshot")
 	}
 	if !unchanged {
 		c.revision++
 	}
 	return c.revision, unchanged
+}
+
+// Restore selection order separately from eviction order. Live selections are newer
+// than restored history; dense ranks also keep persisted counters from overflowing.
+func (c *SessionCache) restoreBindingOrderLocked(restored map[string]struct{}) bool {
+	keys := make([]string, 0, len(c.groups))
+	for key, group := range c.groups {
+		if group.binding.sequence != 0 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		_, restoredI := restored[keys[i]]
+		_, restoredJ := restored[keys[j]]
+		if restoredI != restoredJ {
+			return restoredI
+		}
+		left, right := c.groups[keys[i]].binding.sequence, c.groups[keys[j]].binding.sequence
+		if left != right {
+			return left < right
+		}
+		return keys[i] < keys[j]
+	})
+	changed := false
+	for i, key := range keys {
+		group := c.groups[key]
+		sequence := uint64(i + 1)
+		if group.binding.sequence == sequence {
+			continue
+		}
+		group.binding.sequence = sequence
+		c.groups[key] = group
+		for _, alias := range group.aliases {
+			c.entries[alias] = group
+		}
+		changed = true
+	}
+	c.bindingSequence = uint64(len(keys))
+	return changed
 }
 
 func validSessionSnapshotGroup(group sessionSnapshotGroup) bool {
