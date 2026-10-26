@@ -106,6 +106,13 @@ func readResponsesWebsocketInput(ctx context.Context, cancel context.CancelCause
 				case errors.Is(errInterrupt, cliproxyexecutor.ErrNoActiveUpstreamWebsocket) && local.deliver(payload):
 					appendResponsesInterruptDiagnostic(timeline, payload, "local_http")
 					continue
+				case errors.Is(errInterrupt, cliproxyexecutor.ErrNoActiveUpstreamWebsocket):
+					// The target connection is gone. A 400 would make Codex stop
+					// instead of reconnecting and replaying the conversation.
+					appendResponsesInterruptDiagnostic(timeline, payload, "reconnect")
+					_, _ = writer.closeWithoutError()
+					cancel(errInterrupt)
+					return
 				default:
 					appendResponsesInterruptDiagnostic(timeline, payload, "rejected")
 					// The sanitized outcome replaces raw error logging here: errors

@@ -143,7 +143,7 @@ func TestResponsesLateInterruptDoesNotPoisonNextCreate(t *testing.T) {
 	send(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model))
 	expect("response.created", "r1")
 	expect("response.completed", "r1")
-	send(`{"type":"response.interrupt","response_id":"unknown"}`)
+	send(`{"type":"response.interrupt"}`)
 	expect("error", "")
 	send(`{"type":"response.interrupt","response_id":"r1","mode":"discard_partial_items"}`)
 	send(fmt.Sprintf(`{"type":"response.create","model":%q,"previous_response_id":"r1","input":[]}`, model))
@@ -224,11 +224,11 @@ func TestResponsesInterruptDiagnosticsAreSanitized(t *testing.T) {
 		t.Fatal(errDeadline)
 	}
 	_, payload, errRead := client.ReadMessage()
-	if errRead != nil {
-		t.Fatal(errRead)
+	if errRead == nil {
+		t.Fatalf("missing upstream must close for reconnect without an error frame: %s", payload)
 	}
-	if gjson.GetBytes(payload, "type").String() != "error" {
-		t.Fatalf("unknown interrupt must still fail: %s", payload)
+	if !websocket.IsCloseError(errRead, websocket.CloseAbnormalClosure) {
+		t.Fatalf("expected a transport disconnect, got %v", errRead)
 	}
 	if errClose := client.Close(); errClose != nil {
 		t.Fatal(errClose)
@@ -236,7 +236,7 @@ func TestResponsesInterruptDiagnosticsAreSanitized(t *testing.T) {
 	clientClosed = true
 	select {
 	case timeline := <-timelines:
-		for _, event := range []string{"Event: websocket.interrupt", "Event: websocket.interrupt.outcome", `"outcome":"rejected"`} {
+		for _, event := range []string{"Event: websocket.interrupt", "Event: websocket.interrupt.outcome", `"outcome":"reconnect"`} {
 			if !strings.Contains(timeline, event) {
 				t.Errorf("missing %s in timeline: %s", event, timeline)
 			}

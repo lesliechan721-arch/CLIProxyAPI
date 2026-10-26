@@ -16,6 +16,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -186,14 +187,17 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				// payload errors after response.created are recoverable events;
 				// StreamChunk.Err still arrives through errs and closes the socket.
 				preserveErrorEvent := responseStarted && opts.duplexStream != nil && opts.duplexStream()
-				if eventType == wsEventTypeError && !preserveErrorEvent {
-					payloadErrMsg = responsesWebsocketErrorMessageFromPayload(payloads[i])
-					if h != nil {
-						h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
-					}
-					if opts.suppressError != nil && opts.suppressError(payloadErrMsg) {
-						cancel(payloadErrMsg.Error)
-						return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
+				if eventType == wsEventTypeError {
+					eventErrMsg := responsesWebsocketErrorMessageFromPayload(payloads[i])
+					if !preserveErrorEvent || isResponsesWebsocketInterruptConnectionError(eventErrMsg) {
+						payloadErrMsg = eventErrMsg
+						if h != nil {
+							h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
+						}
+						if opts.suppressError != nil && opts.suppressError(payloadErrMsg) {
+							cancel(payloadErrMsg.Error)
+							return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
+						}
 					}
 				} else if isResponsesWebsocketCompletionEvent(eventType) || eventType == "response.incomplete" {
 					// response.incomplete ends the turn too. Codex uses it, with
@@ -303,7 +307,26 @@ func shouldExposeResponsesUpstreamError(errMsg *interfaces.ErrorMessage) bool {
 	if coreauth.IsTerminalAuthError(errMsg.Error) {
 		return true
 	}
+	if isResponsesWebsocketInterruptConnectionError(errMsg) {
+		return false
+	}
 	return clienterror.IsRequestFault(responsesWebsocketErrorStatus(errMsg), errMsg.Error)
+}
+
+// Older proxies report a lost interrupt target as an invalid request. Treat
+// this exact legacy error as a disconnect so clients can replay on a new socket.
+func isResponsesWebsocketInterruptConnectionError(errMsg *interfaces.ErrorMessage) bool {
+	if errMsg == nil || errMsg.Error == nil || responsesWebsocketErrorStatus(errMsg) != http.StatusBadRequest {
+		return false
+	}
+	body := errMsg.Error.Error()
+	if !gjson.Valid(body) {
+		return false
+	}
+	detail := gjson.Get(body, "error")
+	return detail.Get("type").String() == "invalid_request_error" &&
+		detail.Get("code").String() == "" &&
+		detail.Get("message").String() == cliproxyexecutor.ErrNoActiveUpstreamWebsocket.Error()
 }
 
 func writeResponsesWebsocketTerminalError(

@@ -2746,6 +2746,23 @@ func TestResponsesUpstreamErrorBodyDrivesExposure(t *testing.T) {
 		{name: "forbidden", status: http.StatusForbidden, body: "forbidden"},
 		{name: "too many requests", status: http.StatusTooManyRequests, body: "usage limit reached"},
 		{name: "request timeout", status: http.StatusRequestTimeout, body: "timeout"},
+		{
+			name:   "interrupt target unavailable",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"type":"invalid_request_error","message":"no active upstream websocket for response.interrupt"}}`,
+		},
+		{
+			name:   "interrupt error with policy code",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"type":"invalid_request_error","code":"cyber_policy","message":"no active upstream websocket for response.interrupt"}}`,
+			want:   true,
+		},
+		{
+			name:   "invalid interrupt parameters",
+			status: http.StatusBadRequest,
+			body:   `{"error":{"type":"invalid_request_error","message":"response.interrupt requires response_id"}}`,
+			want:   true,
+		},
 		{name: "bad gateway", status: http.StatusBadGateway, body: "bad gateway"},
 		{
 			name:   "upstream websocket drop",
@@ -3104,6 +3121,13 @@ func TestResponsesWebsocketHidesNonClientUpstreamDisconnectErrors(t *testing.T) 
 		name string
 		err  error
 	}{
+		{
+			name: "legacy interrupt connection error",
+			err: websocketPinnedFailoverStatusError{
+				status: http.StatusBadRequest,
+				msg:    `{"error":{"type":"invalid_request_error","message":"no active upstream websocket for response.interrupt"}}`,
+			},
+		},
 		{
 			name: "abnormal closure",
 			err: &websocket.CloseError{

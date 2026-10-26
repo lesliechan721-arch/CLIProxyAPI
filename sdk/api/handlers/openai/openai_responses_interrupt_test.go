@@ -29,7 +29,7 @@ import (
 
 // TestResponsesInterruptInFlight verifies that a Codex response.interrupt sent while
 // generation is running is forwarded unchanged to the current upstream socket, and that
-// the same socket accepts the next response.create. Idle, malformed, and disabled-auth
+// the same socket accepts the next response.create. Malformed and disabled-auth
 // interrupts must fail locally without opening or writing that socket.
 func TestResponsesInterruptInFlight(t *testing.T) {
 	for _, testCase := range []struct {
@@ -145,10 +145,8 @@ func TestResponsesInterruptInFlight(t *testing.T) {
 
 			send([]byte(`{"type":"response.interrupt"}`))
 			expect("error")
-			send(interrupt)
-			expect("error")
 			if connections.Load() != 0 {
-				t.Fatal("idle interrupt opened an upstream connection")
+				t.Fatal("malformed interrupt opened an upstream connection")
 			}
 
 			send([]byte(fmt.Sprintf(`{"type":"response.create","model":%q,"input":[]}`, model)))
