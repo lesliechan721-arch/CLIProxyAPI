@@ -10,14 +10,16 @@ import (
 	"sync"
 	"time"
 
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 	log "github.com/sirupsen/logrus"
 )
 
 const sessionSnapshotVersion = 1
 
 type sessionSnapshot struct {
-	Version int                    `json:"version"`
-	Groups  []sessionSnapshotGroup `json:"groups"`
+	Version   int                                         `json:"version"`
+	Groups    []sessionSnapshotGroup                      `json:"groups"`
+	LCPGroups []cliproxysession.MerklePrefixSnapshotEntry `json:"lcp_groups,omitempty"`
 }
 
 // Groups are stored from oldest to newest to preserve whole-group eviction.
@@ -36,15 +38,16 @@ type sessionSnapshotBinding struct {
 }
 
 type sessionCachePersistence struct {
-	cache         *SessionCache
-	path          string
-	flushMu       sync.Mutex
-	savedRevision uint64
-	warned        bool
-	stopCh        chan struct{}
-	doneCh        chan struct{}
-	stopOnce      sync.Once
-	save          func(string, sessionSnapshot) error
+	cache            *SessionCache
+	path             string
+	flushMu          sync.Mutex
+	savedRevision    uint64
+	savedLCPRevision uint64
+	warned           bool
+	stopCh           chan struct{}
+	doneCh           chan struct{}
+	stopOnce         sync.Once
+	save             func(string, sessionSnapshot) error
 }
 
 func (c *SessionCache) configurePersistence(path string, restore bool) {
@@ -117,14 +120,15 @@ func (p *sessionCachePersistence) flush() {
 	p.flushMu.Lock()
 	defer p.flushMu.Unlock()
 	c := p.cache
+	lcpGroups, lcpRevision := c.matcher.Snapshot()
 	c.mu.Lock()
 	c.cleanupLocked(time.Now())
 	revision := c.revision
-	if revision == p.savedRevision {
+	if revision == p.savedRevision && lcpRevision == p.savedLCPRevision {
 		c.mu.Unlock()
 		return
 	}
-	snapshot := sessionSnapshot{Version: sessionSnapshotVersion, Groups: make([]sessionSnapshotGroup, 0, len(c.groups))}
+	snapshot := sessionSnapshot{Version: sessionSnapshotVersion, Groups: make([]sessionSnapshotGroup, 0, len(c.groups)), LCPGroups: lcpGroups}
 	for element := c.evictionOrder.Front(); element != nil; element = element.Next() {
 		group := c.groups[element.Value.(string)]
 		stored := sessionSnapshotGroup{
@@ -146,6 +150,7 @@ func (p *sessionCachePersistence) flush() {
 		return
 	}
 	p.savedRevision = revision
+	p.savedLCPRevision = lcpRevision
 	p.warned = false
 }
 
@@ -185,6 +190,10 @@ func (c *SessionCache) restoreSnapshot(path string) (uint64, bool) {
 			unchanged = false
 			continue
 		}
+		if limit := now.Add(c.ttl); c.ttl > 0 && group.ExpiresAt.After(limit) {
+			group.ExpiresAt = limit
+			unchanged = false
+		}
 		previous := make([]sessionEntry, 0, len(group.Aliases))
 		conflict := false
 		for _, alias := range group.Aliases {
@@ -223,6 +232,11 @@ func (c *SessionCache) restoreSnapshot(path string) (uint64, bool) {
 	}
 	if invalid {
 		log.Warn("ignored invalid data in session affinity snapshot")
+	}
+	if c.matcher != nil && len(snapshot.LCPGroups) > 0 {
+		c.matcher.Restore(snapshot.LCPGroups)
+		// Restored groups may be pruned or normalized by TTL and capacity bounds.
+		unchanged = false
 	}
 	if !unchanged {
 		c.revision++

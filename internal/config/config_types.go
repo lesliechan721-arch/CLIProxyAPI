@@ -426,7 +426,7 @@ type RoutingConfig struct {
 	// Automatic failover is always enabled when bound auth becomes unavailable.
 	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
 
-	// SessionAffinityPersistence saves exact session bindings locally across restarts.
+	// SessionAffinityPersistence saves session bindings and LCP matching state locally across restarts.
 	// Default: false. Requires SessionAffinity and is ignored in Home mode.
 	SessionAffinityPersistence bool `yaml:"session-affinity-persistence" json:"session-affinity-persistence,omitempty"`
 

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 )
 
 func sessionTestKey(id string) string { return "openai::" + id + "::gpt-test" }
@@ -29,6 +30,63 @@ func readSessionTestSnapshot(t *testing.T, path string) sessionSnapshot {
 		t.Fatal(errDecode)
 	}
 	return snapshot
+}
+
+func TestSessionAffinityPersistenceLCPRestartAndHandoff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session-affinity.cache")
+	selector := NewSessionAffinitySelector(&FillFirstSelector{})
+	manager := NewManager(nil, selector, nil)
+	t.Cleanup(manager.StopAutoRefresh)
+	manager.ConfigureSessionAffinityPersistence(path, true)
+	options := func(message string) cliproxyexecutor.Options {
+		return cliproxyexecutor.Options{
+			OriginalRequest: []byte(fmt.Sprintf(`{"messages":[{"role":"user","content":%q}]}`, message)),
+			Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: "caller"},
+		}
+	}
+	authA, authB := &Auth{ID: "auth-a"}, &Auth{ID: "auth-b"}
+	pick := func(s *SessionAffinitySelector, message string, auths ...*Auth) {
+		t.Helper()
+		got, errPick := s.Pick(context.Background(), "openai", "gpt-test", options(message), auths)
+		if errPick != nil || got == nil || got.ID != authB.ID {
+			t.Fatalf("LCP Pick = %v, %v, want auth-b", got, errPick)
+		}
+	}
+	pick(selector, "before restart", authB)
+	manager.StopAutoRefresh()
+
+	restored := NewSessionAffinitySelector(&FillFirstSelector{})
+	restoredManager := NewManager(nil, restored, nil)
+	t.Cleanup(restoredManager.StopAutoRefresh)
+	restoredManager.ConfigureSessionAffinityPersistence(path, true)
+	pick(restored, "before restart", authA, authB)
+	pick(restored, "before reload", authB)
+	next := NewSessionAffinitySelector(&FillFirstSelector{})
+	restoredManager.SetSelector(next)
+	pick(next, "before reload", authA, authB)
+	// Results and selections that still use the old selector must reach the live matcher.
+	pick(restored, "after reload", authB)
+	pick(next, "after reload", authA, authB)
+}
+
+func TestSessionCachePersistenceRestoreCapsExpiryAtCurrentTTL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session-affinity.cache")
+	if errWrite := writeSessionSnapshot(path, sessionSnapshot{Version: 1, Groups: []sessionSnapshotGroup{{
+		AuthID: "a", Aliases: []string{sessionTestKey("saved")}, ExpiresAt: time.Now().Add(time.Hour),
+	}}}); errWrite != nil {
+		t.Fatal(errWrite)
+	}
+	const ttl = 5 * time.Minute
+	cache := NewSessionCache(ttl)
+	t.Cleanup(cache.Stop)
+	before := time.Now()
+	cache.configurePersistence(path, true)
+	after := time.Now()
+	cache.flushPersistence()
+	stored := readSessionTestSnapshot(t, path)
+	if len(stored.Groups) != 1 || stored.Groups[0].ExpiresAt.Before(before.Add(ttl)) || stored.Groups[0].ExpiresAt.After(after.Add(ttl)) {
+		t.Fatalf("restored expiry exceeds current TTL: %+v", stored.Groups)
+	}
 }
 
 func TestSessionAffinityPersistenceRestartPreservesAliasesAndExpiry(t *testing.T) {
@@ -246,6 +304,7 @@ func TestSessionCachePersistencePeriodicFlushAndFinalWrite(t *testing.T) {
 
 func TestSessionCachePersistenceStopWaitsAndRoutingDoesNotWaitForIO(t *testing.T) {
 	cache := NewSessionCache(time.Hour)
+	cache.matcher = cliproxysession.NewMerklePrefixMatcher(time.Hour)
 	defer cache.Stop()
 	p := newSessionCachePersistence(cache, filepath.Join(t.TempDir(), "session-affinity.cache"))
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -260,7 +319,11 @@ func TestSessionCachePersistenceStopWaitsAndRoutingDoesNotWaitForIO(t *testing.T
 	ticks <- time.Time{}
 	<-entered
 	mutationDone := make(chan struct{})
-	go func() { cache.Set(sessionTestKey("two"), "b"); close(mutationDone) }()
+	go func() {
+		cache.Set(sessionTestKey("two"), "b")
+		cache.matcher.BindFingerprints("scope", []string{"during-io"}, 1, "b")
+		close(mutationDone)
+	}()
 	select {
 	case <-mutationDone:
 	case <-time.After(5 * time.Second):
@@ -276,8 +339,38 @@ func TestSessionCachePersistenceStopWaitsAndRoutingDoesNotWaitForIO(t *testing.T
 	}
 	close(release)
 	<-stopped
-	if got := readSessionTestSnapshot(t, p.path); len(got.Groups) != 2 {
+	if got := readSessionTestSnapshot(t, p.path); len(got.Groups) != 2 || len(got.LCPGroups) != 1 {
 		t.Fatal("final snapshot omitted mutation made during previous I/O")
+	}
+}
+
+func TestSessionCachePersistenceTracksLCPChanges(t *testing.T) {
+	selector := NewSessionAffinitySelector(nil)
+	t.Cleanup(selector.Stop)
+	p := newSessionCachePersistence(selector.cache, filepath.Join(t.TempDir(), "session-affinity.cache"))
+	writes := 0
+	p.save = func(path string, snapshot sessionSnapshot) error {
+		writes++
+		return writeSessionSnapshot(path, snapshot)
+	}
+	selector.matcher.BindFingerprints("scope", []string{"turn"}, 1, "a")
+	p.flush()
+	if got := readSessionTestSnapshot(t, p.path); len(got.LCPGroups) != 1 || len(got.Groups) != 0 {
+		t.Fatalf("LCP-only binding was not saved: %+v", got)
+	}
+	p.flush()
+	if writes != 1 {
+		t.Fatal("unchanged LCP state caused another disk write")
+	}
+	selector.matcher.MatchFingerprints("scope", []string{"turn"}, 1)
+	p.flush()
+	if writes != 2 {
+		t.Fatal("LCP TTL refresh was not saved")
+	}
+	selector.InvalidateAuth("a")
+	p.flush()
+	if got := readSessionTestSnapshot(t, p.path); writes != 3 || len(got.LCPGroups) != 0 {
+		t.Fatal("LCP invalidation was not saved")
 	}
 }
 
@@ -397,6 +490,7 @@ func TestSessionCachePersistenceConcurrentReplacementAndStop(t *testing.T) {
 			for i := 0; i < 15; i++ {
 				selector := manager.Selector().(*SessionAffinitySelector)
 				selector.cache.Set(sessionTestKey(fmt.Sprintf("%d-%d", worker, i)), "a")
+				selector.matcher.BindFingerprints("scope", []string{fmt.Sprintf("%d-%d", worker, i)}, 1, "a")
 				if i%5 == 0 {
 					manager.SetSelector(NewSessionAffinitySelector(nil))
 				}
@@ -410,8 +504,8 @@ func TestSessionCachePersistenceConcurrentReplacementAndStop(t *testing.T) {
 		go func() { defer stops.Done(); manager.StopAutoRefresh() }()
 	}
 	stops.Wait()
-	if got := readSessionTestSnapshot(t, path); len(got.Groups) != 60 {
-		t.Fatalf("concurrent handoff lost bindings: %d", len(got.Groups))
+	if got := readSessionTestSnapshot(t, path); len(got.Groups) != 60 || len(got.LCPGroups) != 60 {
+		t.Fatalf("concurrent handoff lost bindings: exact=%d LCP=%d", len(got.Groups), len(got.LCPGroups))
 	}
 }
 

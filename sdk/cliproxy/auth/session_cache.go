@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	cliproxysession "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/session"
 )
 
 const (
@@ -39,6 +41,7 @@ type SessionCache struct {
 	revision         uint64
 	persistenceMu    sync.Mutex
 	persistence      *sessionCachePersistence
+	matcher          *cliproxysession.MerklePrefixMatcher
 	stopped          bool
 	stopCh           chan struct{}
 	stopOnce         sync.Once

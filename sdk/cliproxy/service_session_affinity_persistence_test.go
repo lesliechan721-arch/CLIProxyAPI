@@ -2,6 +2,7 @@ package cliproxy
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -34,6 +35,19 @@ func pickPersistenceSession(t *testing.T, selector coreauth.Selector, sessionID 
 	got, errPick := selector.Pick(context.Background(), "openai", "gpt-test", cliproxyexecutor.Options{Headers: headers}, auths)
 	if errPick != nil || got == nil {
 		t.Fatalf("Pick = %+v, %v", got, errPick)
+	}
+	return got.ID
+}
+
+func pickPersistenceLCPSession(t *testing.T, selector coreauth.Selector, message string, auths ...*coreauth.Auth) string {
+	t.Helper()
+	options := cliproxyexecutor.Options{
+		OriginalRequest: []byte(fmt.Sprintf(`{"messages":[{"role":"user","content":%q}]}`, message)),
+		Metadata:        map[string]any{cliproxyexecutor.CallerScopeMetadataKey: "caller"},
+	}
+	got, errPick := selector.Pick(context.Background(), "openai", "gpt-test", options, auths)
+	if errPick != nil || got == nil {
+		t.Fatalf("LCP Pick = %+v, %v", got, errPick)
 	}
 	return got.ID
 }
@@ -74,6 +88,7 @@ func TestBuilderSessionAffinityPersistenceRestartAndHotReload(t *testing.T) {
 	if got := pickPersistenceSession(t, original, "stable", &coreauth.Auth{ID: "b"}); got != "b" {
 		t.Fatal("initial binding did not use available credential")
 	}
+	pickPersistenceLCPSession(t, original, "stable LCP", &coreauth.Auth{ID: "b"})
 	unrelated := *cfg
 	unrelated.Debug = true
 	service.applyWatcherConfigUpdate(&unrelated)
@@ -89,6 +104,7 @@ func TestBuilderSessionAffinityPersistenceRestartAndHotReload(t *testing.T) {
 	}
 	// Calls that retained the old selector must still update the live exact-ID cache.
 	pickPersistenceSession(t, original, "late", &coreauth.Auth{ID: "b"})
+	pickPersistenceLCPSession(t, original, "late LCP", &coreauth.Auth{ID: "b"})
 	if got := pickPersistenceSession(t, replacement, "late", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {
 		t.Fatal("late old selector binding was discarded")
 	}
@@ -112,6 +128,9 @@ func TestBuilderSessionAffinityPersistenceRestartAndHotReload(t *testing.T) {
 		if got := pickPersistenceSession(t, restarted.coreManager.Selector(), session, &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {
 			t.Fatalf("restarted session %q selected %q, want b", session, got)
 		}
+		if got := pickPersistenceLCPSession(t, restarted.coreManager.Selector(), session+" LCP", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {
+			t.Fatalf("restarted LCP session %q selected %q, want b", session, got)
+		}
 	}
 }
 
@@ -122,6 +141,7 @@ func TestServiceSessionAffinityPersistenceHotEnableDisableAndPathChange(t *testi
 	service := buildSessionPersistenceService(t, cfg)
 	original := service.coreManager.Selector()
 	pickPersistenceSession(t, original, "live", &coreauth.Auth{ID: "b"})
+	pickPersistenceLCPSession(t, original, "live LCP", &coreauth.Auth{ID: "b"})
 	enabled := *cfg
 	enabled.Routing.SessionAffinityPersistence = true
 	service.applyWatcherConfigUpdate(&enabled)
@@ -137,11 +157,17 @@ func TestServiceSessionAffinityPersistenceHotEnableDisableAndPathChange(t *testi
 	}
 	// Change a binding while disk still contains the former credential.
 	pickPersistenceSession(t, original, "live", &coreauth.Auth{ID: "a"})
+	original.(*coreauth.SessionAffinitySelector).InvalidateAuth("b")
+	pickPersistenceLCPSession(t, original, "live LCP", &coreauth.Auth{ID: "a"})
 	service.applyWatcherConfigUpdate(&enabled)
 	if got := pickPersistenceSession(t, service.coreManager.Selector(), "live", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "a" {
 		t.Fatal("hot enable restored stale disk state")
 	}
+	if got := pickPersistenceLCPSession(t, service.coreManager.Selector(), "live LCP", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "a" {
+		t.Fatal("hot enable restored stale LCP state")
+	}
 	pickPersistenceSession(t, original, "new-path", &coreauth.Auth{ID: "b"})
+	pickPersistenceLCPSession(t, original, "new-path LCP", &coreauth.Auth{ID: "b"})
 	moved := enabled
 	moved.AuthDir = t.TempDir()
 	service.applyWatcherConfigUpdate(&moved)
@@ -154,6 +180,9 @@ func TestServiceSessionAffinityPersistenceHotEnableDisableAndPathChange(t *testi
 	restarted := buildSessionPersistenceService(t, &moved)
 	if got := pickPersistenceSession(t, restarted.coreManager.Selector(), "new-path", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {
 		t.Fatal("path transition lost current bindings")
+	}
+	if got := pickPersistenceLCPSession(t, restarted.coreManager.Selector(), "new-path LCP", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {
+		t.Fatal("path transition lost current LCP bindings")
 	}
 	oldPath := buildSessionPersistenceService(t, &enabled)
 	if got := pickPersistenceSession(t, oldPath.coreManager.Selector(), "new-path", &coreauth.Auth{ID: "a"}, &coreauth.Auth{ID: "b"}); got != "b" {

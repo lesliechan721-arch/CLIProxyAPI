@@ -1071,10 +1071,13 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		subagentAffinity = *cfg.SubagentAffinity
 	}
 	rebindOnQuotaOnly := normalizeSessionAffinityRebindOn(cfg.RebindOn) == SessionAffinityRebindOnQuota
+	cache := NewSessionCache(cfg.TTL)
+	matcher := cliproxysession.NewMerklePrefixMatcher(cfg.TTL)
+	cache.matcher = matcher
 	return &SessionAffinitySelector{
 		fallback:          cfg.Fallback,
-		cache:             NewSessionCache(cfg.TTL),
-		matcher:           cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
+		cache:             cache,
+		matcher:           matcher,
 		subagentAffinity:  subagentAffinity,
 		rebindOnQuotaOnly: rebindOnQuotaOnly,
 	}
@@ -1541,7 +1544,7 @@ func (s *SessionAffinitySelector) Stop() {
 	if s.cache != nil && !s.cacheTransferred {
 		s.cache.Stop()
 	}
-	if s.matcher != nil {
+	if s.matcher != nil && !s.cacheTransferred {
 		s.matcher.Clear()
 	}
 }
@@ -1568,9 +1571,11 @@ func (s *SessionAffinitySelector) transferCache(next *SessionAffinitySelector) {
 		next.cache.mu.RUnlock()
 		next.cache.Stop()
 		next.cache = s.cache
+		next.matcher = s.matcher
 		s.cache.mu.Lock()
 		s.cache.ttl = ttl
 		s.cache.mu.Unlock()
+		s.matcher.SetTTL(ttl)
 	}
 	s.cache.flushPersistence()
 	s.cacheTransferred = true

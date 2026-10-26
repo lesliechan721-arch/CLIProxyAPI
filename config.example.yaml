@@ -160,13 +160,14 @@ routing:
   # credential is kept even if a higher-priority credential recovers. Credential priority
   # still decides cold bindings, requests without a session, and post-failover rebinding.
   session-affinity: false # default: false
-  # Save exact session-ID bindings in <auth-dir>/.runtime/session-affinity.cache.
+  # Save session-ID bindings and LCP matching state in <auth-dir>/.runtime/session-affinity.cache.
   # Requires session-affinity. Default: false. Ignored in Home mode.
   # Changed state is saved every 5 seconds and when routing workers stop after
   # API listeners and gateways close. Forced termination can lose recent changes;
   # late result callbacks after the final snapshot are excluded.
   # Keep auth-dir on a persistent volume for container recreation. Use one service
-  # instance per snapshot file. LCP matching and upstream WebSocket state are not saved.
+  # instance per snapshot file. Upstream WebSocket state is not saved.
+  # Restored expiry is capped at the current session-affinity-ttl.
   # Guardian parent selection history is saved too. Older snapshots restore exact
   # bindings only, until a new parent request records its selection history.
   session-affinity-persistence: false
@@ -486,7 +487,8 @@ upstream:
     # timeout is a fallback and
     # verified native OS/arch values remain client-supplied. When stabilize-device-profile is
     # enabled, OS/arch are pinned to the values below and cached profiles remain constrained to
-    # the same exact software baseline rather than learning newer client versions.
+    # the same exact software baseline rather than learning newer client versions (unless the
+    # credential resolves to cloak_mode: never, which preserves the confirmed caller's headers).
     # header-defaults:
     #   user-agent: "claude-cli/2.1.280 (external, cli)"
     #   package-version: "0.112.1"
