@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
@@ -18,13 +19,16 @@ import (
 	runtimeexecutor "github.com/router-for-me/CLIProxyAPI/v8/internal/runtime/executor"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
-	"github.com/tidwall/gjson"
 )
 
 func TestResponsesWebsocketSameUpstreamRetry(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	for _, provider := range []string{"codex", "xai"} {
-		for _, scenario := range []string{"recovers", "exhausted", "after-payload"} {
+		scenarios := []string{"recovers", "exhausted", "after-payload"}
+		if provider == "codex" {
+			scenarios = append(scenarios, "disconnect-before-output")
+		}
+		for _, scenario := range scenarios {
 			t.Run(provider+"/"+scenario, func(t *testing.T) {
 				var attempts atomic.Int32
 				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -38,7 +42,14 @@ func TestResponsesWebsocketSameUpstreamRetry(t *testing.T) {
 						return
 					}
 					attempt := attempts.Add(1)
+					if scenario == "disconnect-before-output" {
+						return
+					}
 					if scenario == "exhausted" || (scenario == "recovers" && attempt < 3) {
+						if provider == "codex" {
+							_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","status":503,"error":{"type":"server_error","message":"upstream overloaded"}}`))
+							_, _, _ = conn.ReadMessage()
+						}
 						return
 					}
 					_ = conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"response.created","response":{"id":"retry-response","status":"in_progress"}}`))
@@ -84,6 +95,7 @@ func TestResponsesWebsocketSameUpstreamRetry(t *testing.T) {
 					t.Fatal(errWrite)
 				}
 				completed := false
+				lostTurn := provider == "codex" && (scenario == "disconnect-before-output" || scenario == "after-payload")
 				for {
 					_, payload, errRead := conn.ReadMessage()
 					if errRead != nil {
@@ -93,13 +105,19 @@ func TestResponsesWebsocketSameUpstreamRetry(t *testing.T) {
 						}
 						break
 					}
-					if gjson.GetBytes(payload, "type").String() == "response.completed" {
+					if lostTurn && ojson.GetBytesNoCopy(payload, "type").String() == "error" {
+						if code := ojson.GetBytesNoCopy(payload, "error.code").String(); code != "upstream_websocket_lost" {
+							t.Fatalf("loss error code = %q, want upstream_websocket_lost", code)
+						}
+						break
+					}
+					if ojson.GetBytesNoCopy(payload, "type").String() == "response.completed" {
 						completed = true
 						break
 					}
 				}
 				wantAttempts := int32(3)
-				if scenario == "after-payload" {
+				if scenario == "after-payload" || lostTurn {
 					wantAttempts = 1
 				}
 				if attempts.Load() != wantAttempts || completed != (scenario == "recovers") {

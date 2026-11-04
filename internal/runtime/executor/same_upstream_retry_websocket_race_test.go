@@ -143,8 +143,8 @@ func TestHomeSameUpstreamRetryRegistersFailureBeforeDelivery(t *testing.T) {
 			}
 			select {
 			case deferred := <-registered:
-				if !deferred {
-					t.Fatal("failure consumed its retry budget before registration")
+				if wantDeferred := provider != "codex"; deferred != wantDeferred {
+					t.Fatalf("failure deferred=%t, want %t", deferred, wantDeferred)
 				}
 			default:
 				t.Fatal("connection became replaceable before failure registration")
@@ -158,6 +158,16 @@ func TestHomeSameUpstreamRetryRegistersFailureBeforeDelivery(t *testing.T) {
 			case err = <-done:
 			case <-time.After(3 * time.Second):
 				t.Fatal("retry did not complete")
+			}
+			if provider == "codex" {
+				if !cliproxyexecutor.IsUpstreamWebsocketTurnError(err) || attempts.Load() != 1 || dispatcher.calls.Load() != 1 {
+					t.Fatalf("lost turn must not replay: attempts=%d dispatches=%d error=%v", attempts.Load(), dispatcher.calls.Load(), err)
+				}
+				manager.CloseExecutionSession(t.Name())
+				if errDrain := scopes.Drain(ctx); errDrain != nil {
+					t.Fatal(errDrain)
+				}
+				return
 			}
 			if err != nil {
 				t.Fatal(err)
@@ -256,6 +266,16 @@ func TestHomeSameUpstreamRetryHandlesCloseBeforeBind(t *testing.T) {
 			case disconnectErr := <-disconnectChannel(t.Name()):
 				t.Fatalf("disconnect notified before handler was bound: %v", disconnectErr)
 			default:
+			}
+			if provider == "codex" {
+				if !cliproxyexecutor.IsUpstreamWebsocketTurnError(err) || connections.Load() != 1 || attempts.Load() != 0 || dispatcher.calls.Load() != 1 {
+					t.Fatalf("pre-bind loss must not replay: connections=%d attempts=%d dispatches=%d error=%v", connections.Load(), attempts.Load(), dispatcher.calls.Load(), err)
+				}
+				manager.CloseExecutionSession(t.Name())
+				if errDrain := scopes.Drain(ctx); errDrain != nil {
+					t.Fatal(errDrain)
+				}
+				return
 			}
 			if err != nil || connections.Load() != 2 || dispatcher.calls.Load() != 1 {
 				t.Fatalf("did not recover the first close with the same Home scope")

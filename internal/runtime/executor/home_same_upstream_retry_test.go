@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -83,6 +84,22 @@ func TestHomeCodexWebsocketSameUpstreamRetry(t *testing.T) {
 			opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: t.Name()}
 			ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 			result, errStream := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
+			if failure == "disconnect" {
+				if errStream == nil {
+					_, errStream = drainChunks(result)
+				}
+				if !cliproxyexecutor.IsUpstreamWebsocketTurnError(errStream) {
+					t.Fatalf("disconnect error = %v, want a lost turn without replay", errStream)
+				}
+				if attempts.Load() != 1 || dispatcher.calls.Load() != 1 {
+					t.Fatalf("lost turn replayed: attempts=%d dispatches=%d", attempts.Load(), dispatcher.calls.Load())
+				}
+				manager.CloseExecutionSession(t.Name())
+				if errDrain := scopes.Drain(context.Background()); errDrain != nil {
+					t.Fatal(errDrain)
+				}
+				return
+			}
 			if errStream != nil {
 				t.Fatal(errStream)
 			}
@@ -150,11 +167,15 @@ func TestHomeCodexSameUpstreamRetryReleasesTerminalScope(t *testing.T) {
 	opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: t.Name()}
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 	result, err := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
-	if err != nil && !errors.Is(err, context.Canceled) {
-		t.Fatal(err)
-	}
 	if result != nil {
-		_, _ = drainChunks(result)
+		_, errDrain := drainChunks(result)
+		if err == nil {
+			err = errDrain
+		}
+	}
+	var status interface{ StatusCode() int }
+	if !errors.As(err, &status) || status.StatusCode() != http.StatusInternalServerError {
+		t.Fatalf("terminal buffered error = %v, want original upstream status 500", err)
 	}
 	sess := exec.getOrCreateSession(t.Name())
 	sess.connMu.Lock()
@@ -171,103 +192,195 @@ func TestHomeCodexSameUpstreamRetryReleasesTerminalScope(t *testing.T) {
 	}
 }
 
-func TestHomeCodexUnbufferedErrorSameUpstreamRetry(t *testing.T) {
-	for _, failure := range []struct {
-		name, frame string
-	}{
-		{"error", `{"type":"error","status":503,"error":{"type":"server_error","message":"upstream overloaded"}}`},
-		{"response_failed", `{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"server_error","status":500,"message":"upstream processing failed"}}}`},
+func TestCodexBufferedFailureNotifiesAfterErrorHandoff(t *testing.T) {
+	for _, output := range []struct{ name, frame string }{
+		{"bootstrap", codexInProgressEvent},
+		{"live", `{"type":"response.output_text.delta","delta":"hello"}`},
 	} {
-		for _, mode := range []string{"recovered", "exhausted", "after_payload"} {
-			t.Run(failure.name+"/"+mode, func(t *testing.T) {
-				var attempts atomic.Int32
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
-					if err != nil {
-						return
+		t.Run(output.name, func(t *testing.T) {
+			server := codexWebsocketServerHoldingConnection(t, codexCreatedEvent, output.frame,
+				`{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"server_error","status":500,"message":"upstream processing failed"}}}`)
+			defer server.Close()
+			exec := NewCodexWebsocketsExecutor(codexBufferingConfig(true))
+			exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+			defer exec.CloseExecutionSession(t.Name())
+			req, opts := codexWebsocketRequest()
+			opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: t.Name()}
+			ctx, cancel := context.WithTimeout(cliproxyexecutor.WithDownstreamWebsocket(t.Context()), 5*time.Second)
+			defer cancel()
+			result, errStream := exec.ExecuteStream(ctx, codexTestAuth(server.URL), req, opts)
+			if errStream != nil {
+				t.Fatal(errStream)
+			}
+			disconnect := exec.UpstreamDisconnectChan(t.Name())
+			for {
+				select {
+				case <-disconnect:
+					t.Fatal("disconnect was notified before the buffered error handoff")
+				default:
+				}
+				select {
+				case chunk, ok := <-result.Chunks:
+					if !ok {
+						t.Fatal("buffered stream closed without its upstream error")
 					}
-					defer func() { _ = conn.Close() }()
-					if _, _, err = conn.ReadMessage(); err != nil {
-						return
+					if chunk.Err == nil {
+						continue
 					}
-					attempt := attempts.Add(1)
-					frames := []string{failure.frame}
-					if mode == "recovered" && attempt > 1 {
-						frames = []string{codexCreatedEvent, codexCompletedEventBody}
-					} else if mode == "after_payload" {
-						frames = append([]string{codexCreatedEvent}, frames...)
+					var status interface{ StatusCode() int }
+					if !errors.As(chunk.Err, &status) || status.StatusCode() != http.StatusInternalServerError {
+						t.Fatalf("buffered stream error = %v, want upstream status 500", chunk.Err)
 					}
-					for _, frame := range frames {
-						if err = conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+				case <-ctx.Done():
+					t.Fatal("buffered stream did not deliver its error")
+				}
+				break
+			}
+			select {
+			case <-disconnect:
+			case <-ctx.Done():
+				t.Fatal("buffered stream did not notify disconnect after error handoff")
+			}
+		})
+	}
+}
+
+func TestHomeCodexStreamErrorSameUpstreamRetry(t *testing.T) {
+	for _, buffering := range []bool{false, true} {
+		for _, failure := range []struct {
+			name, frame string
+			status      int
+		}{
+			{"error", `{"type":"error","status":503,"error":{"type":"server_error","message":"upstream overloaded"}}`, http.StatusServiceUnavailable},
+			{"response_failed", `{"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"server_error","status":500,"message":"upstream processing failed"}}}`, http.StatusInternalServerError},
+		} {
+			for _, mode := range []string{"recovered", "exhausted", "after_payload"} {
+				t.Run(fmt.Sprintf("buffering=%t/%s/%s", buffering, failure.name, mode), func(t *testing.T) {
+					var attempts atomic.Int32
+					upstreamClosed := make(chan struct{}, 1)
+					server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+						if err != nil {
 							return
 						}
-					}
-					_, _, _ = conn.ReadMessage()
-				}))
-				defer server.Close()
-				cfg := codexBufferingConfig(false)
-				cfg.SameUpstreamRetry = 1
-				cfg.Home = config.HomeConfig{Enabled: true}
-				exec := NewCodexWebsocketsExecutor(cfg)
-				exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
-				auth := codexTestAuth(server.URL)
-				auth.ID, auth.Provider = "same-upstream-unbuffered", "codex"
-				auth.Attributes["websockets"] = "true"
-				dispatcher := &sameUpstreamHomeDispatcher{auth: auth}
-				scopes := executionregistry.New()
-				manager := cliproxyauth.NewManager(nil, nil, nil)
-				manager.SetConfig(cfg)
-				manager.SetRetryConfig(0, 0, 0)
-				manager.PublishHomeDispatch(dispatcher, scopes, 1)
-				manager.RegisterExecutor(exec)
-				defer manager.CloseExecutionSession(t.Name())
-				req, opts := codexWebsocketRequest()
-				opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: t.Name()}
-				ctx, cancel := context.WithTimeout(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), 5*time.Second)
-				defer cancel()
-				result, errStream := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
-				if result != nil {
-					_, errDrain := drainChunks(result)
-					if errStream == nil {
-						errStream = errDrain
-					}
-				}
-				if mode == "recovered" {
-					if errStream != nil {
-						t.Fatal(errStream)
-					}
-					select {
-					case errDisconnect := <-exec.UpstreamDisconnectChan(t.Name()):
-						t.Fatalf("recovered retry notified downstream disconnect: %v", errDisconnect)
-					default:
-					}
-				} else {
-					if mode == "exhausted" && errStream == nil {
-						t.Fatal("expected terminal stream error")
-					}
-					select {
-					case <-exec.UpstreamDisconnectChan(t.Name()):
-					case <-ctx.Done():
-						t.Fatal("terminal stream error did not notify downstream disconnect")
-					}
-					if active := scopes.FreezeInFlight(time.Time{}).Executions; len(active) != 0 {
-						t.Fatalf("terminal stream retained %d Home scopes", len(active))
-					}
-				}
-				if mode == "exhausted" {
-					if attempts.Load() < 2 {
-						t.Fatalf("attempts=%d, want retry budget exhausted", attempts.Load())
-					}
-				} else {
-					wantAttempts := int32(2)
+						defer func() { _ = conn.Close() }()
+						if _, _, err = conn.ReadMessage(); err != nil {
+							return
+						}
+						attempt := attempts.Add(1)
+						frames := []string{failure.frame}
+						if mode == "recovered" && attempt > 1 {
+							frames = []string{codexCreatedEvent, codexCompletedEventBody}
+						} else if mode == "after_payload" {
+							frames = append([]string{codexCreatedEvent, `{"type":"response.output_text.delta","delta":"hello"}`}, frames...)
+						}
+						for _, frame := range frames {
+							if err = conn.WriteMessage(websocket.TextMessage, []byte(frame)); err != nil {
+								return
+							}
+						}
+						_, _, _ = conn.ReadMessage()
+						select {
+						case upstreamClosed <- struct{}{}:
+						default:
+						}
+					}))
+					defer server.Close()
+					cfg := codexBufferingConfig(buffering)
+					cfg.SameUpstreamRetry = 1
+					cfg.Home = config.HomeConfig{Enabled: true}
+					exec := NewCodexWebsocketsExecutor(cfg)
+					exec.store = &codexWebsocketSessionStore{sessions: make(map[string]*codexWebsocketSession)}
+					auth := codexTestAuth(server.URL)
+					auth.ID, auth.Provider = "same-upstream-unbuffered", "codex"
+					auth.Attributes["websockets"] = "true"
+					dispatcher := &sameUpstreamHomeDispatcher{auth: auth}
+					scopes := executionregistry.New()
+					manager := cliproxyauth.NewManager(nil, nil, nil)
+					manager.SetConfig(cfg)
+					manager.SetRetryConfig(0, 0, 0)
+					manager.PublishHomeDispatch(dispatcher, scopes, 1)
+					manager.RegisterExecutor(exec)
+					defer manager.CloseExecutionSession(t.Name())
+					req, opts := codexWebsocketRequest()
+					opts.Metadata = map[string]any{cliproxyexecutor.ExecutionSessionMetadataKey: t.Name()}
+					ctx, cancel := context.WithTimeout(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), 5*time.Second)
+					defer cancel()
+					disconnect := exec.UpstreamDisconnectChan(t.Name())
+					notified := make(chan struct{})
 					if mode == "after_payload" {
-						wantAttempts = 1
+						go func() {
+							select {
+							case <-disconnect:
+								close(notified)
+								cancel()
+							case <-ctx.Done():
+							}
+						}()
 					}
-					if attempts.Load() != wantAttempts || dispatcher.calls.Load() != 1 {
-						t.Fatalf("attempts=%d dispatches=%d, want %d attempts in one Home scope", attempts.Load(), dispatcher.calls.Load(), wantAttempts)
+					result, errStream := manager.ExecuteStream(ctx, []string{"codex"}, req, opts)
+					if mode == "after_payload" {
+						// Let terminal invalidation close the upstream while the manager's
+						// caller has not yet consumed any of the stream output.
+						select {
+						case <-upstreamClosed:
+						case <-ctx.Done():
+							// An early notification cancels the real downstream listener.
+							// The exact error assertion below must still reject a lost error.
+						}
 					}
-				}
-			})
+					if result != nil {
+						_, errDrain := drainChunks(result)
+						if errStream == nil {
+							errStream = errDrain
+						}
+					}
+					if mode == "recovered" {
+						if errStream != nil {
+							t.Fatal(errStream)
+						}
+						select {
+						case errDisconnect := <-exec.UpstreamDisconnectChan(t.Name()):
+							t.Fatalf("recovered retry notified downstream disconnect: %v", errDisconnect)
+						default:
+						}
+					} else {
+						var status interface{ StatusCode() int }
+						if !errors.As(errStream, &status) || status.StatusCode() != failure.status {
+							t.Fatalf("terminal stream error = %v, want original upstream status %d", errStream, failure.status)
+						}
+						if mode == "after_payload" {
+							select {
+							case <-notified:
+							case <-t.Context().Done():
+								t.Fatal("terminal stream error did not notify downstream disconnect")
+							}
+						} else {
+							select {
+							case <-exec.UpstreamDisconnectChan(t.Name()):
+								t.Fatal("failure before output closed the downstream before failover")
+							default:
+							}
+						}
+						if active := scopes.FreezeInFlight(time.Time{}).Executions; len(active) != 0 {
+							t.Fatalf("terminal stream retained %d Home scopes", len(active))
+						}
+					}
+					if mode == "exhausted" {
+						if attempts.Load() < 2 {
+							t.Fatalf("attempts=%d, want retry budget exhausted", attempts.Load())
+						}
+					} else {
+						wantAttempts := int32(2)
+						if mode == "after_payload" {
+							wantAttempts = 1
+						}
+						if attempts.Load() != wantAttempts || dispatcher.calls.Load() != 1 {
+							t.Fatalf("attempts=%d dispatches=%d, want %d attempts in one Home scope", attempts.Load(), dispatcher.calls.Load(), wantAttempts)
+						}
+					}
+				})
+			}
 		}
 	}
 }

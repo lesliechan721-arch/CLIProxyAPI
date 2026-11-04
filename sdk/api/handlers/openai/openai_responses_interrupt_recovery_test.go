@@ -8,12 +8,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
-	"github.com/tidwall/gjson"
 )
 
 // An older proxy can report a lost interrupt target as a generic 400. Both
@@ -65,7 +65,7 @@ func TestForwardResponsesWebsocketInterruptConnectionError(t *testing.T) {
 				t.Fatal(errDeadline)
 			}
 			_, created, errCreated := client.ReadMessage()
-			if errCreated != nil || gjson.GetBytes(created, "type").String() != "response.created" {
+			if errCreated != nil || ojson.GetBytesNoCopy(created, "type").String() != "response.created" {
 				t.Fatalf("expected response.created, got %s, %v", created, errCreated)
 			}
 			_, payload, errRead := client.ReadMessage()
