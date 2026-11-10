@@ -104,6 +104,7 @@ type reviewedInPlaceByteWrite struct {
 }
 
 var reviewedInPlaceByteWrites = map[string]reviewedInPlaceByteWrite{
+	"internal/kvstore/bolt_store.go":                                {1, "copies into a freshly allocated envelope before publication; no no-copy JSON result can alias the destination"},
 	"internal/translator/common/apply_patch_responses.go":           {1, "shifts [][]byte item references in a private output slice; no byte of any JSON payload is rewritten"},
 	"internal/translator/common/vertex_partial_args.go":             {1, "shifts []string object keys to insert a key; no byte of any payload is rewritten"},
 	"internal/runtime/executor/claude_signing.go":                   {2, "writes CCH digits into bytes.Clone(body); the caller's body is never touched"},
@@ -114,7 +115,6 @@ var reviewedInPlaceByteWrites = map[string]reviewedInPlaceByteWrite{
 	"internal/runtime/executor/helps/claude_mcp_alias.go":           {1, "copies an HMAC sum into a local fixed-size digest array"},
 	"internal/client/codex/live/tcp_proxy.go":                       {1, "copies header and payload into a freshly allocated frame"},
 	"internal/home/client.go":                                       {1, "zeroes a secret buffer after json.Unmarshal has copied every value out"},
-	"internal/kvstore/bolt_store.go":                                {1, "copies the value into a freshly allocated envelope buffer before returning it; the input buffer is never modified"},
 	"internal/pluginstore/auth.go":                                  {1, "zeroes a locally built credential buffer after base64 encoding copied it out"},
 }
 

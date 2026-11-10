@@ -58,14 +58,14 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	}
 	originalTranslated = helps.SetStringIfDifferent(originalTranslated, "model", baseModel)
 	doc := ojson.NewDoc(body)
-	normalizeCodexClaudeOutputBudgetDoc(doc, from, req.Payload)
+	normalizeCodexOutputBudgetDoc(doc)
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 
 	if err = helps.ApplyRequestThinkingDoc(doc, req, opts, from.String(), to.String(), e.Identifier(), updatesChanged); err != nil {
 		return resp, err
 	}
 
-	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts))
+	ctx = helps.WithPayloadFinalizer(ctx, helps.NewPayloadFinalizer(e.cfg, e.Identifier(), baseModel, to.String(), "", originalTranslated, req, opts, auth))
 	helps.SetStringIfDifferentDoc(doc, "model", baseModel)
 	helps.SetBoolIfDifferentDoc(doc, "stream", true)
 	_ = doc.Delete("previous_response_id")
@@ -80,7 +80,11 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 	if !useSIWC {
 		normalizeCodexInstructionsDoc(doc, helps.IsNativeCodexRequest(req.Payload, opts))
 		if e.cfg == nil || e.cfg.DisableImageGeneration == config.DisableImageGenerationOff {
-			ensureImageGenerationToolDoc(doc, baseModel, auth, opts.Headers)
+			checkModel := req.Model
+			if strings.TrimSpace(checkModel) == "" {
+				checkModel = baseModel
+			}
+			ensureImageGenerationToolDoc(doc, checkModel, auth, opts.Headers)
 			if !codexAuthUsesAPIKey(auth) {
 				normalizeCodexImageGenerationToolsDoc(doc)
 			}
