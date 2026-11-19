@@ -3,7 +3,6 @@ package openai
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MoeForge/moego/json"
 	"github.com/MoeForge/moego/ojson"
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -28,7 +28,7 @@ type responsesWebsocketForwardOptions struct {
 	duplexStream             func() bool
 	toolCacheTurn            *responsesWebsocketToolCacheTurn
 	suppressError            func(*interfaces.ErrorMessage) bool
-	keepAliveInterval        *time.Duration
+	onDownstreamCommit       func()
 	localInterrupt           *responsesLocalInterrupt
 	// websocketOwned reports whether this turn runs on an upstream
 	// websocket. While true, no interrupt may claim the local HTTP path.
@@ -66,19 +66,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 		downstreamSessionKey = websocketDownstreamSessionKey(c.Request)
 	}
 
-	var keepAliveTicker *time.Ticker
-	var keepAliveC <-chan time.Time
-	keepAliveInterval := time.Duration(0)
-	if h != nil {
-		keepAliveInterval = handlers.StreamingKeepAliveInterval(h.CurrentConfig())
-	}
-	if opts.keepAliveInterval != nil {
-		keepAliveInterval = *opts.keepAliveInterval
-	}
-	if keepAliveInterval > 0 {
-		keepAliveTicker = time.NewTicker(keepAliveInterval)
-		defer keepAliveTicker.Stop()
-		keepAliveC = keepAliveTicker.C
+	markDownstreamCommitted := func() {
+		if opts.onDownstreamCommit != nil {
+			opts.onDownstreamCommit()
+		}
 	}
 	if opts.localInterrupt != nil {
 		websocketOwned := opts.websocketOwned != nil && opts.websocketOwned()
@@ -96,6 +87,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			// already gone need no answer.
 			if c.Request.Context().Err() == nil {
 				if claimed := opts.localInterrupt.takeClaimed(); claimed != nil {
+					markDownstreamCommitted()
 					_, _ = writeResponsesWebsocketError(writer, wsTimelineLog, &interfaces.ErrorMessage{
 						StatusCode: http.StatusBadRequest,
 						Error:      errors.New("no active response to interrupt"),
@@ -153,15 +145,12 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				}
 				continue
 			}
+			markDownstreamCommitted()
 			return completeResponsesWebsocketLocalInterrupt(writer, wsTimelineLog, cancel, interruptPayload, outputItemsByIndex, outputItemsFallback, pendingToolCallIDs)
 		case <-c.Request.Context().Done():
-			cancel(c.Request.Context().Err())
-			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, c.Request.Context().Err()
-		case <-keepAliveC:
-			if errPing := writer.writePing(); errPing != nil {
-				cancel(errPing)
-				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, errPing
-			}
+			cause := context.Cause(c.Request.Context())
+			cancel(cause)
+			return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, cause
 		case errMsg, ok := <-errs:
 			if !ok {
 				errs = nil
@@ -212,9 +201,6 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				cancel(nil)
 				return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), nil, nil
 			}
-			if keepAliveTicker != nil && keepAliveInterval > 0 {
-				keepAliveTicker.Reset(keepAliveInterval)
-			}
 
 			// A queued local interrupt belongs to an in-flight HTTP turn:
 			// consume it before forwarding more upstream payload. Once the
@@ -222,10 +208,12 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			if opts.localInterrupt != nil {
 				if interruptPayload := opts.localInterrupt.takeClaimed(); interruptPayload != nil {
 					if !turnEnded {
+						markDownstreamCommitted()
 						return completeResponsesWebsocketLocalInterrupt(writer, wsTimelineLog, cancel, interruptPayload, outputItemsByIndex, outputItemsFallback, pendingToolCallIDs)
 					}
 					// The response is over: reject instead of fabricating an
 					// incomplete event, then keep forwarding this chunk.
+					markDownstreamCommitted()
 					if _, errWrite := writeResponsesWebsocketError(writer, wsTimelineLog, &interfaces.ErrorMessage{
 						StatusCode: http.StatusBadRequest,
 						Error:      errors.New("no active response to interrupt"),
@@ -245,6 +233,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				}
 				if eventType == "response.created" {
 					responseStarted = true
+					markDownstreamCommitted()
 					completed = false
 					turnEnded = false
 					if opts.localInterrupt != nil {
@@ -265,25 +254,24 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 				}
 				recordPendingToolCallIDsFromPayload(pendingToolCallIDs, payloads[i])
 				var payloadErrMsg *interfaces.ErrorMessage
-				// In Codex duplex mode the executor owns connection termination:
-				// payload errors after response.created are recoverable events;
-				// StreamChunk.Err still arrives through errs and closes the socket.
-				preserveErrorEvent := responseStarted && opts.duplexStream != nil && opts.duplexStream()
+				// Codex duplex can keep the socket open for ordinary errors after
+				// response.created. Quota and lost-interrupt errors still need the
+				// replay/close path.
 				if eventType == wsEventTypeError {
-					eventErrMsg := responsesWebsocketErrorMessageFromPayload(payloads[i])
-					if !preserveErrorEvent || isResponsesWebsocketInterruptConnectionError(eventErrMsg) {
-						payloadErrMsg = eventErrMsg
-						if h != nil {
-							h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), payloadErrMsg)
-						}
-						if opts.suppressError != nil && opts.suppressError(payloadErrMsg) {
+					errMsg := responsesWebsocketErrorMessageFromPayload(payloads[i])
+					if errMsg != nil && h != nil {
+						h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), errMsg)
+					}
+					preserveErrorEvent := responseStarted && opts.duplexStream != nil && opts.duplexStream() &&
+						!isResponsesWebsocketInterruptConnectionError(errMsg) &&
+						(errMsg == nil || !isResponsesWebsocketQuotaOrCooldownError(errMsg.Error))
+					if preserveErrorEvent {
+						turnEnded = true
+					} else {
+						payloadErrMsg = errMsg
+						if payloadErrMsg != nil && opts.suppressError != nil && opts.suppressError(payloadErrMsg) {
 							cancel(payloadErrMsg.Error)
 							return completedOutput, completedResponseID, sortedStringSet(pendingToolCallIDs), payloadErrMsg, nil
-						}
-					} else {
-						turnEnded = true
-						if eventErrMsg != nil && h != nil {
-							h.LoggingAPIResponseError(context.WithValue(context.Background(), "gin", c), eventErrMsg)
 						}
 					}
 				} else if isResponsesWebsocketCompletionEvent(eventType) || eventType == "response.incomplete" {
@@ -337,6 +325,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					// reactivated it.
 					opts.localInterrupt.deactivate()
 				}
+				markDownstreamCommitted()
 				if errWrite := writeResponsesWebsocketPayload(writer, wsTimelineLog, payloads[i], time.Now()); errWrite != nil {
 					log.Warnf(
 						"responses websocket: downstream_out write failed id=%s event=%s error=%v",

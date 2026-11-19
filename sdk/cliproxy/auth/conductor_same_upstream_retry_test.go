@@ -236,20 +236,29 @@ func TestHomeSameUpstreamRetryKeepsSelection(t *testing.T) {
 
 func TestSameUpstreamRetryHonorsRequestTermination(t *testing.T) {
 	for _, kind := range []string{"execute", "count", "stream", "bootstrap"} {
-		for _, failure := range []string{"canceled", "request-fault", "stop-rule"} {
+		for _, failure := range []string{"canceled", "request-fault", "stop-rule", "snapshot-stop-rule"} {
 			t.Run(kind+"/"+failure, func(t *testing.T) {
 				manager := NewManager(nil, &FillFirstSelector{}, nil)
 				manager.SetConfig(&internalconfig.Config{SameUpstreamRetry: 3})
 				manager.SetRetryConfig(0, 0, 0)
 				registerRetryRoundLocalAuths(t, manager, "same-upstream", "termination", map[string]int{"a": 0, "b": 0})
-				if failure == "stop-rule" {
+				requestCtx := t.Context()
+				if failure == "stop-rule" || failure == "snapshot-stop-rule" {
 					auth, _ := manager.GetByID("a")
-					auth.Metadata["request_scoped_errors"] = []internalconfig.RequestScopedErrorRule{{Status: 503, Match: []string{"stop this request"}, Action: "stop"}}
+					rules := []internalconfig.RequestScopedErrorRule{{Status: 503, Match: []string{"stop this request"}, Action: "stop"}}
+					if failure == "snapshot-stop-rule" {
+						auth.Attributes = map[string]string{"auth_kind": "oauth"}
+						requestCtx = WithRequestScopedErrorConfig(requestCtx, &internalconfig.Config{
+							OAuthRequestScopedErrors: map[string][]internalconfig.RequestScopedErrorRule{"same-upstream": rules},
+						})
+					} else {
+						auth.Metadata["request_scoped_errors"] = rules
+					}
 					if _, errUpdate := manager.Update(context.Background(), auth); errUpdate != nil {
 						t.Fatal(errUpdate)
 					}
 				}
-				ctx, cancel := context.WithCancel(context.Background())
+				ctx, cancel := context.WithCancel(requestCtx)
 				defer cancel()
 				calls := 0
 				execute := func(context.Context, *Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
@@ -287,6 +296,51 @@ func TestSameUpstreamRetryHonorsRequestTermination(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+func TestSameUpstreamRetryKeepsErrorRulesAcrossFailover(t *testing.T) {
+	manager := NewManager(nil, &FillFirstSelector{}, nil)
+	const provider, model = "same-upstream", "reload-error-rules"
+	oldConfig := &internalconfig.Config{
+		SameUpstreamRetry: 1,
+		OAuthRequestScopedErrors: map[string][]internalconfig.RequestScopedErrorRule{
+			provider: {{Status: 503, Match: []string{"stop this request"}, Action: "stop"}},
+		},
+	}
+	newConfig := &internalconfig.Config{SameUpstreamRetry: 1}
+	manager.SetConfig(oldConfig)
+	manager.SetRetryConfig(0, 0, 0)
+	ids := registerRetryRoundLocalAuths(t, manager, provider, model, map[string]int{"a": 0, "b": 0})
+	for _, id := range ids {
+		auth, _ := manager.GetByID(id)
+		auth.Attributes = map[string]string{"auth_kind": "oauth"}
+		if _, errUpdate := manager.Update(t.Context(), auth); errUpdate != nil {
+			t.Fatal(errUpdate)
+		}
+	}
+	var calls []string
+	manager.RegisterExecutor(&mockCustomErrorExecutor{
+		identifier: provider,
+		executeFn: func(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+			calls = append(calls, auth.ID)
+			if auth.ID == "a" {
+				manager.SetConfig(newConfig)
+				return cliproxyexecutor.Response{}, &Error{HTTPStatus: 403}
+			}
+			return cliproxyexecutor.Response{}, &Error{HTTPStatus: 503, Message: "stop this request"}
+		},
+	})
+	if errExecute := invokeSameUpstreamRetry(t.Context(), manager, "execute", model, cliproxyexecutor.Options{}); statusCodeFromError(errExecute) != 503 {
+		t.Fatalf("execution error = %v, want the stop rule's 503", errExecute)
+	}
+	if !reflect.DeepEqual(calls, []string{"a", "b"}) {
+		t.Fatalf("calls = %v, want [a b]", calls)
+	}
+	calls = nil
+	_ = invokeSameUpstreamRetry(t.Context(), manager, "execute", model, cliproxyexecutor.Options{})
+	if len(calls) < 2 || !reflect.DeepEqual(calls[len(calls)-2:], []string{"b", "b"}) {
+		t.Fatalf("next request calls = %v, want b to retry with the new rules", calls)
 	}
 }
 

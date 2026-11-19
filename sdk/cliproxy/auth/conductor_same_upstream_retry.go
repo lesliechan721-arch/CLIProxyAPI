@@ -29,7 +29,7 @@ func (m *Manager) isSameUpstreamRetryable(ctx context.Context, auth *Auth, err e
 	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isRequestTerminatedError(err) || isRequestStopError(err) || isRequestInvalidError(err) || isCloudflareChallengeError(err) {
 		return false
 	}
-	if _, matched := matchRequestScopedErrorAction(auth, err, m.runtimeConfigSnapshot()); matched {
+	if _, matched := matchRequestScopedErrorAction(auth, err, m.requestScopedErrorConfig(ctx)); matched {
 		return false
 	}
 	status := statusCodeFromError(err)
