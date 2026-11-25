@@ -198,6 +198,21 @@ func TestApplyPatchActualProviderErrorAndEOF(t *testing.T) {
 					if errExecuteStream != nil {
 						t.Fatal(errExecuteStream)
 					}
+					if provider == "antigravity" && mode == "empty" {
+						// An empty upstream body is rejected before apply_patch receives any events.
+						var streamErr error
+						for chunk := range stream.Chunks {
+							if len(chunk.Payload) != 0 || chunk.Err == nil || streamErr != nil {
+								t.Fatalf("expected a single empty-stream error, got %+v", chunk)
+							}
+							streamErr = chunk.Err
+						}
+						status, okStatus := streamErr.(interface{ StatusCode() int })
+						if !okStatus || status.StatusCode() != http.StatusBadGateway || streamErr.Error() != helps.GeminiZeroOutputErrorMessage(sdktranslator.FormatOpenAIResponse, "") {
+							t.Fatalf("expected the empty upstream 502, got %T %v", streamErr, streamErr)
+						}
+						return
+					}
 					assertTask6FailedStream(t, stream.Chunks)
 				}
 			})

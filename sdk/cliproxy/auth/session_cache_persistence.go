@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -234,7 +235,13 @@ func (c *SessionCache) restoreSnapshot(path string) (uint64, bool) {
 		log.Warn("ignored invalid data in session affinity snapshot")
 	}
 	if c.matcher != nil && len(snapshot.LCPGroups) > 0 {
-		c.matcher.Restore(snapshot.LCPGroups)
+		// Older snapshots grouped Gemini, Vertex and AI Studio under "google".
+		// The snapshot does not identify the provider, so do not reuse those bindings.
+		groups := slices.DeleteFunc(snapshot.LCPGroups, func(group cliproxysession.MerklePrefixSnapshotEntry) bool {
+			provider, _, _, ok := parseLCPNamespace(group.Namespace)
+			return ok && provider == "google"
+		})
+		c.matcher.Restore(groups)
 		// Restored groups may be pruned or normalized by TTL and capacity bounds.
 		unchanged = false
 	}

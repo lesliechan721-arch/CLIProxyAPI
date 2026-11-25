@@ -132,7 +132,7 @@ func TestHomeUpstreamRetryDeferralDoesNotBlockScopeCancellation(t *testing.T) {
 	budgets := make(map[sameUpstreamRetryKey]*atomic.Int64)
 	remaining := manager.sameUpstreamRetryBudget(budgets, selection.Auth.ID, "model", true)
 	opts := cliproxyexecutor.Options{ExecutionLifecycle: selection}
-	finish := manager.deferUpstreamFailures(attemptCtx, selection.Auth, &opts, remaining)
+	finish := manager.deferUpstreamFailures(attemptCtx, func() *Auth { return selection.Auth }, &opts, remaining)
 	defer finish()
 	if errClose := registry.Close(); errClose != nil {
 		t.Fatal(errClose)

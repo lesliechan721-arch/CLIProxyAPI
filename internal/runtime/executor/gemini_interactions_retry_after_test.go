@@ -352,3 +352,65 @@ func TestAntigravityZeroRetryDelayPreservesSemantics_Issue7565(t *testing.T) {
 	sErr := newAntigravityStatusErr(http.StatusTooManyRequests, body)
 	assertRetryAfterDuration(t, sErr, 0)
 }
+
+func TestGeminiSameUpstreamRetryRespectsHTTPRetryAfter(t *testing.T) {
+	const model = "gemini-2.5-pro"
+	for _, mode := range []string{"execute", "count", "stream"} {
+		t.Run(mode, func(t *testing.T) {
+			var calls atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Retry-After", "120")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte(`{"error":{"code":503,"message":"unavailable"}}`))
+			}))
+			t.Cleanup(server.Close)
+
+			cfg := &config.Config{SameUpstreamRetry: 1}
+			manager := cliproxyauth.NewManager(nil, &cliproxyauth.FillFirstSelector{}, nil)
+			manager.SetConfig(cfg)
+			manager.SetRetryConfig(0, 0, 0)
+			manager.RegisterExecutor(NewGeminiExecutor(cfg))
+			id := t.Name()
+			registry.GetGlobalRegistry().RegisterClient(id, "gemini", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(id) })
+			if _, errRegister := manager.Register(context.Background(), &cliproxyauth.Auth{
+				ID: id, Provider: "gemini", Attributes: map[string]string{"api_key": "test-key", "base_url": server.URL},
+			}); errRegister != nil {
+				t.Fatal(errRegister)
+			}
+
+			ctx := context.Background()
+			providers := []string{"gemini"}
+			req := cliproxyexecutor.Request{Model: model, Payload: []byte(`{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`)}
+			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatGemini, ResponseFormat: sdktranslator.FormatGemini}
+			before := time.Now()
+			var err error
+			switch mode {
+			case "execute":
+				_, err = manager.Execute(ctx, providers, req, opts)
+			case "count":
+				_, err = manager.ExecuteCount(ctx, providers, req, opts)
+			case "stream":
+				opts.Stream = true
+				var res *cliproxyexecutor.StreamResult
+				res, err = manager.ExecuteStream(ctx, providers, req, opts)
+				if res != nil {
+					for chunk := range res.Chunks {
+						if chunk.Err != nil {
+							err = chunk.Err
+						}
+					}
+				}
+			}
+			var status interface{ StatusCode() int }
+			if !errors.As(err, &status) || status.StatusCode() != http.StatusServiceUnavailable || calls.Load() != 1 {
+				t.Fatalf("got %v and %d HTTP requests, want HTTP 503 without immediate replay", err, calls.Load())
+			}
+			credential, _ := manager.GetByID(id)
+			if state := credential.ModelStates[model]; state == nil || state.NextRetryAfter.Before(before.Add(119*time.Second)) {
+				t.Fatalf("model cooldown = %+v, want upstream Retry-After of 120 seconds", state)
+			}
+		})
+	}
+}

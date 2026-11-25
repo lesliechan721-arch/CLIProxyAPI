@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"reflect"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
@@ -49,6 +50,7 @@ func TestManagerSameUpstreamRetry(t *testing.T) {
 	previous := transientErrorCooldownSeconds.Load()
 	SetTransientErrorCooldownSeconds(60)
 	t.Cleanup(func() { transientErrorCooldownSeconds.Store(previous) })
+	hint := time.Minute
 	for _, kind := range []string{"execute", "count", "stream", "bootstrap"} {
 		for _, tc := range []struct {
 			name       string
@@ -62,6 +64,7 @@ func TestManagerSameUpstreamRetry(t *testing.T) {
 			{"default", 0, 1, &Error{HTTPStatus: 503}, []string{"a", "b"}, "b", true},
 			{"recovers", 2, 2, &Error{HTTPStatus: 503}, []string{"a", "a", "a"}, "a", false},
 			{"exhausted", 2, 3, &Error{HTTPStatus: 503}, []string{"a", "a", "a", "b"}, "b", true},
+			{"retry-after", 2, 1, customStatusError{code: 503, msg: "unavailable", retryAfter: &hint}, []string{"a", "b"}, "b", true},
 			{"transport", 2, 1, io.ErrUnexpectedEOF, []string{"a", "a"}, "a", false},
 			{"forbidden", 2, 1, &Error{HTTPStatus: 403}, []string{"a", "b"}, "b", true},
 			{"unauthorized", 2, 1, &Error{HTTPStatus: 401}, []string{"a", "b"}, "b", true},
@@ -451,7 +454,7 @@ func TestAntigravityCreditsSameUpstreamRetry(t *testing.T) {
 		identifier: "antigravity",
 		executeFn: func(ctx context.Context, auth *Auth, req cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 			if !AntigravityCreditsRequested(ctx) {
-				return cliproxyexecutor.Response{}, &Error{HTTPStatus: 429}
+				return cliproxyexecutor.Response{}, &Error{HTTPStatus: 429, Code: "quota_exhausted"}
 			}
 			creditCalls++
 			if auth.ID != authID || req.Model != model {

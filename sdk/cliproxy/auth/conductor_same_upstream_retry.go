@@ -3,10 +3,15 @@ package auth
 import (
 	"context"
 	"errors"
+	"math"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
@@ -29,18 +34,48 @@ func (m *Manager) isSameUpstreamRetryable(ctx context.Context, auth *Auth, err e
 	if err == nil || ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || isRequestTerminatedError(err) || isRequestStopError(err) || isRequestInvalidError(err) || isCloudflareChallengeError(err) {
 		return false
 	}
+	if isTOSViolationError(err) || isAntigravityValidationRequiredError(err) || cliproxyexecutor.IsUpstreamWebsocketTurnError(err) {
+		return false
+	}
+	if hint := trustedRetryAfterHint(err); hint != nil && *hint > 0 {
+		return false
+	}
 	if _, matched := matchRequestScopedErrorAction(auth, err, m.requestScopedErrorConfig(ctx)); matched {
 		return false
 	}
 	status := statusCodeFromError(err)
+	return isSameUpstreamRetryStatus(status) || status == 0 && (isTransientTransportError(err) || isConnectionLifecycleError(err))
+}
+
+func isSameUpstreamRetryStatus(status int) bool {
 	switch status {
 	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout, 520, 521, 522, 523, 524, 525, 526:
+		return true
 	default:
-		if status != 0 || (!isTransientTransportError(err) && !isConnectionLifecycleError(err)) {
-			return false
-		}
+		return false
 	}
-	return true
+}
+
+// Some executors only parse Retry-After on 429s. Preserve a valid hint on a
+// transient error from the current attempt so the usual cooldown can use it.
+func (m *Manager) applySameUpstreamRetryAfter(ctx context.Context, err error, streamHeaders http.Header) error {
+	if err == nil || m.sameUpstreamRetryCount() == 0 || !isSameUpstreamRetryStatus(statusCodeFromError(err)) || trustedRetryAfterHint(err) != nil {
+		return err
+	}
+	raw := strings.TrimSpace(logging.GetResponseHeaders(ctx).Get("Retry-After"))
+	if raw == "" {
+		raw = strings.TrimSpace(streamHeaders.Get("Retry-After"))
+	}
+	if raw == "" {
+		return err
+	}
+	var delay time.Duration
+	if seconds, errParse := strconv.ParseUint(raw, 10, 64); errParse == nil {
+		delay = time.Duration(min(seconds, uint64(math.MaxInt64/int64(time.Second)))) * time.Second
+	} else if deadline, errParseTime := http.ParseTime(raw); errParseTime == nil {
+		delay = time.Until(deadline)
+	}
+	return withTrustedRetryAfter(err, &delay)
 }
 
 type sameUpstreamRetryKey struct {
@@ -61,12 +96,12 @@ func (m *Manager) sameUpstreamRetryBudget(budgets map[sameUpstreamRetryKey]*atom
 	return remaining
 }
 
-func (m *Manager) deferUpstreamFailures(ctx context.Context, auth *Auth, opts *cliproxyexecutor.Options, remaining *atomic.Int64) func() {
+func (m *Manager) deferUpstreamFailures(ctx context.Context, currentAuth func() *Auth, opts *cliproxyexecutor.Options, remaining *atomic.Int64) func() {
 	if remaining.Load() <= 0 {
 		return func() {}
 	}
 	handler := &sameUpstreamFailureHandler{active: true, retryable: func(err error) bool {
-		return remaining.Load() > 0 && m.isSameUpstreamRetryable(ctx, auth, err)
+		return remaining.Load() > 0 && m.isSameUpstreamRetryable(ctx, currentAuth(), err)
 	}}
 	opts.UpstreamFailureHandler = handler
 	return handler.Commit
@@ -108,33 +143,14 @@ func (h *sameUpstreamFailureHandler) Commit() {
 
 // executeWithSameUpstreamRetry defers result recording until the selected
 // credential/model has recovered or exhausted its additional attempts.
-func executeWithSameUpstreamRetry[T any](ctx context.Context, m *Manager, auth *Auth, remaining *atomic.Int64, execute func(context.Context) (T, error)) (T, context.Context, error) {
+func executeWithSameUpstreamRetry[T any](ctx context.Context, m *Manager, currentAuth func() *Auth, remaining *atomic.Int64, execute func(context.Context) (T, error)) (T, context.Context, error) {
 	for {
 		response, errExecute := execute(ctx)
 		errExecute = markUpstreamExecutionAttemptFromContext(ctx, errExecute)
-		if !m.consumeSameUpstreamRetry(ctx, auth, errExecute, remaining) {
+		errExecute = m.applySameUpstreamRetryAfter(ctx, errExecute, nil)
+		if !m.consumeSameUpstreamRetry(ctx, currentAuth(), errExecute, remaining) {
 			return response, ctx, errExecute
 		}
 		ctx = newUpstreamAttemptContext(ctx)
-	}
-}
-
-// readBootstrapWithSameUpstreamRetry never replays a stream after its first payload.
-func (m *Manager) readBootstrapWithSameUpstreamRetry(ctx context.Context, auth *Auth, remaining *atomic.Int64, stream *cliproxyexecutor.StreamResult, execute func(context.Context) (*cliproxyexecutor.StreamResult, error)) (*cliproxyexecutor.StreamResult, []cliproxyexecutor.StreamChunk, bool, context.Context, error) {
-	for {
-		buffered, closed, errBootstrap := readStreamBootstrap(ctx, stream.Chunks)
-		errBootstrap = markUpstreamExecutionAttemptFromContext(ctx, errBootstrap)
-		if !m.consumeSameUpstreamRetry(ctx, auth, errBootstrap, remaining) {
-			return stream, buffered, closed, ctx, errBootstrap
-		}
-		discardStreamChunks(stream.Chunks)
-		ctx = newUpstreamAttemptContext(ctx)
-		retryStream, retryCtx, errStream := executeWithSameUpstreamRetry(ctx, m, auth, remaining, execute)
-		ctx = retryCtx
-		retryStream, errStream = validateStreamResult(retryStream, errStream)
-		if errStream != nil {
-			return &cliproxyexecutor.StreamResult{}, nil, false, ctx, errStream
-		}
-		stream = retryStream
 	}
 }

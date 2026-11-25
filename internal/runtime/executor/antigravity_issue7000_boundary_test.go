@@ -72,9 +72,12 @@ func TestIssue7000AntigravityAliasesPreserveOtherFieldsAndToolChoice(t *testing.
 					}
 					request := ojson.GetBytes(encoded, "request")
 					assertIssue7000PromptSchema(t, request.Get(systemKey), issue7000LiteralSchema)
+					if got := request.Get(systemKey + ".parts.0.text").String(); got != "keep system" && !strings.HasPrefix(got, "keep system\n\n") {
+						t.Errorf("first system part did not preserve the original instruction: %q", got)
+					}
 					for path, want := range map[string]string{
 						"generationConfig.temperature": "0.25", "generation_config.stopSequences.0": "STOP",
-						systemKey + ".parts.0.text": "keep system", "contents.0.parts.0.text": "keep history",
+						"contents.0.parts.0.text":             "keep history",
 						"tools.0.functionDeclarations.0.name": "lookup",
 					} {
 						if got := request.Get(path).String(); got != want {
@@ -118,9 +121,12 @@ func TestIssue7000AntigravityModelAndPlainRequestBoundaries(t *testing.T) {
 		convert bool
 	}{
 		{"claude-opus-5-5", true}, {"claude-sonnet-5-5-high", true},
+		{"claude-opus-5-5-low", true}, {"claude-opus-5-5-medium", true}, {"claude-opus-5-5-max", true},
+		{"claude-sonnet-5-5-low", true}, {"claude-sonnet-5-5-medium", true}, {"claude-sonnet-5-5-max", true},
 		{"claude-opus-5-5-reasoning", true}, {"claude-sonnet-5-5(high)", true},
 		{"claude-opus-5-5-20261001", true}, {"claude-sonnet-5-5[1m]", true},
-		{"claude-opus-5-5-20261001[1m](high)", true},
+		{"claude-opus-5-5-20261001[1m](high)", true}, {"claude-opus-5-5-max-20261001[1m](max)", true},
+		{"claude-opus-5-5-custom", false},
 		{"claude-opus-5-50-high", false}, {"claude-sonnet-5-50", false},
 		{"claude-opus-4-6", false}, {"claude-haiku-5-5", false},
 		{"gemini-3.8-flash-high", false}, {"other/claude-opus-5-5-high", false},
@@ -137,6 +143,9 @@ func TestIssue7000AntigravityModelAndPlainRequestBoundaries(t *testing.T) {
 			}
 			if tc.convert {
 				assertIssue7000PromptSchema(t, ojson.GetBytes(encoded, "request.systemInstruction"), `{"type":"object","properties":{"title":{"type":"string"}}}`)
+				if mode := ojson.GetBytes(encoded, "request.toolConfig.functionCallingConfig.mode").String(); mode != "" && mode != "AUTO" {
+					t.Errorf("functionCallingConfig.mode = %q, want AUTO or omitted when converted", mode)
+				}
 			}
 		})
 	}

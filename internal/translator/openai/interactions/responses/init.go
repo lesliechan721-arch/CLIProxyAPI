@@ -6,6 +6,7 @@ import (
 	"github.com/MoeForge/moego/ojson"
 	. "github.com/router-for-me/CLIProxyAPI/v8/internal/constant"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/translator"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
@@ -35,7 +36,8 @@ func init() {
 	sdktranslator.RegisterRequestEnvelope(sdktranslator.FormatOpenAIResponse, sdktranslator.FormatInteractions,
 		func(ctx context.Context, req sdktranslator.RequestEnvelope) sdktranslator.RequestEnvelope {
 			target, _ := ctx.Value(geminiInteractionsTargetKey{}).(*geminiInteractionsTarget)
-			req.Body, req.Err = convertOpenAIResponsesRequestToInteractions(req.Model, req.Body, req.Stream, target)
+			replayDevin, _ := ctx.Value(common.DevinReasoningReplayKey{}).(bool)
+			req.Body, req.Err = convertOpenAIResponsesRequestToInteractions(req.Model, req.Body, req.Stream, target, replayDevin)
 			return req
 		},
 	)

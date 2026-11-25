@@ -69,6 +69,30 @@ func TestSessionAffinityPersistenceLCPRestartAndHandoff(t *testing.T) {
 	pick(next, "after reload", authA, authB)
 }
 
+func TestSessionAffinityPersistenceDropsOnlyLegacyGoogleLCP(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session-affinity.cache")
+	legacy := NewSessionAffinitySelector(nil)
+	t.Cleanup(legacy.Stop)
+	googleScope := "lcp:v1::google::gemini-test::caller"
+	openAIScope := "lcp:v1::openai::gpt-test::caller"
+	fingerprints := []string{"turn"}
+	legacy.matcher.BindFingerprints(googleScope, fingerprints, 1, "old-google-auth")
+	legacy.matcher.BindFingerprints(openAIScope, fingerprints, 1, "openai-auth")
+	legacy.cache.Set(sessionTestKey("exact"), "exact-auth")
+	newSessionCachePersistence(legacy.cache, path).flush()
+
+	restored := NewSessionAffinitySelector(nil)
+	t.Cleanup(restored.Stop)
+	restored.cache.configurePersistence(path, true)
+	groups, _ := restored.matcher.Snapshot()
+	if len(groups) != 1 || groups[0].Namespace != openAIScope || groups[0].AuthID != "openai-auth" {
+		t.Fatalf("restored LCP groups = %+v, want only the OpenAI binding", groups)
+	}
+	if got, ok := restored.cache.Get(sessionTestKey("exact")); !ok || got != "exact-auth" {
+		t.Fatalf("restored exact session = %q, %v; want exact-auth", got, ok)
+	}
+}
+
 func TestSessionCachePersistenceRestoreCapsExpiryAtCurrentTTL(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "session-affinity.cache")
 	if errWrite := writeSessionSnapshot(path, sessionSnapshot{Version: 1, Groups: []sessionSnapshotGroup{{
